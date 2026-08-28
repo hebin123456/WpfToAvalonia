@@ -18,6 +18,9 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private readonly List<ConversionNote> _notes = new();
     private readonly HashSet<string> _dedupe = new();
     private readonly Stack<string> _methodNames = new();
+    /// <summary>类级撞名原方法名栈（VisitClassDeclaration 预扫描，见 CS-OVERRIDE-CLASH）。</summary>
+    private readonly Stack<HashSet<string>> _clashOriginals = new();
+    private static readonly HashSet<string> NoClashes = new();
     private int _resourceVarCounter;
 
     public bool WpfDetected { get; private set; }
@@ -115,6 +118,14 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     {
         var name = node.Name?.ToString().Trim() ?? "";
         if (name == "System.Windows") _sawSystemWindows = true;
+        // WPF 独有命名空间：整条 using 移除（Avalonia 无等价，留着只会 CS0246）
+        if (KnownMaps.WpfOnlyNamespaces.Contains(name))
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Warning, "CS-USING-WPFONLY",
+                $"using {name} 已移除：WPF 独有命名空间（Interop/Navigation/Media3D/Shell/Resources），Avalonia 无等价；文件内限定引用另行提示。");
+            return null;
+        }
         if (name.Length > 0 && KnownMaps.CSharpNamespaces.TryGetValue(name, out var mapped))
         {
             WpfDetected = true;
@@ -154,6 +165,16 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             WpfDetected = true;
             Note(node, NoteSeverity.Info, "CS-VISIBILITY", "Visibility.Visible → true（Avalonia 12：IsVisible 布尔）。");
             return SyntaxFactory.LiteralExpression(SyntaxKind.TrueLiteralExpression).WithTriviaFrom(node);
+        }
+
+        // WPF 独有命名空间限定引用：保留原样 + 人工提示（须在前缀重写之前，
+        // 否则 System.Windows.Interop.X 会被错误映射为 global::Avalonia.Interop.X）
+        // 注意用 TryWpfOnlyNs 判定分支：NoteWpfOnlyQualified 去重后返回 false，
+        // 不能作为分支依据，否则去重后仍会落入前缀重写。
+        if (TryWpfOnlyNs(text, out _))
+        {
+            NoteWpfOnlyQualified(node, text);
+            return base.VisitMemberAccessExpression(node);
         }
 
         // 全限定前缀重写（System.Windows.Media.Brushes.Red 等）
@@ -332,6 +353,38 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     {
         var callee = node.Expression.ToString();
 
+        // —— base.Xxx() 随虚方法重命名同步改写 ——
+        // override 方法改了名（OnMouseDown→OnPointerPressed 等），方法体内的
+        // base.OnMouseDown(e) 调用必须同步重命名，否则 CS0115。
+        // 撞名保留原名的方法（CS-OVERRIDE-CLASH）不改，保持与声明一致。
+        if (node.Expression is MemberAccessExpressionSyntax bma &&
+            bma.Expression is BaseExpressionSyntax &&
+            KnownMaps.OverrideMethodRenames.TryGetValue(bma.Name.Identifier.ValueText, out var bmap) &&
+            !bmap.NewName.Equals(bma.Name.Identifier.ValueText, StringComparison.Ordinal) &&
+            !IsInClashMethod())
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-BASE-RENAME",
+                $"base.{bma.Name.Identifier.ValueText}(...) → base.{bmap.NewName}(...)（虚方法重命名的 base 调用同步改写）。");
+            return node.WithExpression(
+                bma.WithName(SyntaxFactory.IdentifierName(bmap.NewName).WithTriviaFrom(bma.Name)));
+        }
+        // base.OnApplyTemplate() 同步补参（方法名未变但 Avalonia 12 签名带参）
+        if (node.Expression is MemberAccessExpressionSyntax bma2 &&
+            bma2.Expression is BaseExpressionSyntax &&
+            bma2.Name.Identifier.ValueText == "OnApplyTemplate" &&
+            node.ArgumentList.Arguments.Count == 0)
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-BASE-APPLYTEMPLATE",
+                "base.OnApplyTemplate() → base.OnApplyTemplate(e)（Avalonia 12 OnApplyTemplate 带 TemplateAppliedEventArgs 参数）。");
+            return node.WithArgumentList(
+                SyntaxFactory.ArgumentList(
+                        SyntaxFactory.SeparatedList(new[]
+                            { SyntaxFactory.Argument(SyntaxFactory.IdentifierName("e")) }))
+                    .WithTriviaFrom(node.ArgumentList));
+        }
+
         switch (callee)
         {
             case "Keyboard.Focus":
@@ -425,6 +478,13 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 return node.WithExpression(
                     ma.WithName(SyntaxFactory.IdentifierName("Post")).WithTriviaFrom(ma));
             }
+        }
+
+        // WPF 独有命名空间限定调用：保留原样 + 人工提示（不落入 System.Windows→Avalonia 前缀重写）
+        if (TryWpfOnlyNs(callee, out _))
+        {
+            NoteWpfOnlyQualified(node, callee);
+            return base.VisitInvocationExpression(node);
         }
 
         // 全限定调用重写
@@ -674,6 +734,73 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         _methodNames.Push(node.Identifier.ValueText);
         try
         {
+            var name = node.Identifier.ValueText;
+            var isOverride = node.Modifiers.Any(SyntaxKind.OverrideKeyword);
+
+            // —— 虚方法覆盖重命名（OverrideMethodRenames，反射+探针验证）——
+            // 仅对 override 修饰的方法生效：普通私有方法与虚方法同名（如事件处理器
+            // void OnMouseDown(object, MouseButtonEventArgs)）不受影响。
+            // 撞名组（CS-OVERRIDE-CLASH）保留原名，避免产出重复方法定义。
+            if (isOverride && KnownMaps.OverrideMethodRenames.TryGetValue(name, out var map) &&
+                !CurrentClashSet.Contains(name))
+            {
+                var renamed = node;
+
+                // 可访问性调整（Render：protected→public；OnApplyTemplate：public→protected）
+                if (map.Access == "public") renamed = WithAccess(renamed, SyntaxKind.PublicKeyword);
+                else if (map.Access == "protected") renamed = WithAccess(renamed, SyntaxKind.ProtectedKeyword);
+
+                renamed = renamed.WithIdentifier(
+                    SyntaxFactory.Identifier(map.NewName).WithTriviaFrom(node.Identifier));
+
+                // 参数 0/1 类型强制覆盖（保留参数名与 trivia）
+                if (map.Param0Type != null && renamed.ParameterList.Parameters.Count > 0)
+                    renamed = renamed.WithParameterList(
+                        WithParamType(renamed.ParameterList, 0, map.Param0Type));
+                if (map.Param1Type != null && renamed.ParameterList.Parameters.Count > 1)
+                    renamed = renamed.WithParameterList(
+                        WithParamType(renamed.ParameterList, 1, map.Param1Type));
+
+                // OnApplyTemplate：WPF 无参 → 补 TemplateAppliedEventArgs e（base 调用同步补参）
+                if (name == "OnApplyTemplate" && renamed.ParameterList.Parameters.Count == 0)
+                {
+                    var param = SyntaxFactory.Parameter(default, default,
+                        SyntaxFactory.ParseTypeName("global::Avalonia.Controls.Primitives.TemplateAppliedEventArgs"),
+                        SyntaxFactory.Identifier("e"), null);
+                    renamed = renamed.WithParameterList(
+                        SyntaxFactory.ParameterList(SyntaxFactory.SeparatedList(new[] { param }))
+                            .WithTriviaFrom(node.ParameterList));
+                }
+
+                WpfDetected = true;
+                Note(node, NoteSeverity.Info, "CS-OVERRIDE-RENAME",
+                    $"override {name} → {map.NewName}（WPF 覆盖虚方法 → Avalonia 12 虚方法；"
+                    + $"参数/可访问性已按映射表调整，base 调用同步重写）。");
+
+                if (map.NewName.StartsWith("OnPointer", StringComparison.Ordinal) || map.NewName == "OnDoubleTapped")
+                    Note(node, NoteSeverity.Warning, "CS-POINTER-ARGS-BODY",
+                        "指针参数成员差异需校对：e.ChangedButton/e.LeftButton/e.ButtonState → "
+                        + "e.GetCurrentPoint(this).Properties（PointerUpdateKind / IsLeftButtonPressed）；e.GetPosition(el) 保留。");
+
+                if (name == "OnRender")
+                    Note(node, NoteSeverity.Warning, "CS-ONRENDER-BODY",
+                        "签名已转 public Render(DrawingContext)；WPF DrawingContext API（DrawText/DrawGeometry 参数、"
+                        + "FormattedText 构造）与 Avalonia 不同，方法体需人工校对。");
+
+                if (name == "OnApplyTemplate")
+                    Note(node, NoteSeverity.Warning, "CS-APPLYTEMPLATE",
+                        "WPF 无参 OnApplyTemplate → Avalonia 12 带参 OnApplyTemplate(TemplateAppliedEventArgs e)；"
+                        + "base.OnApplyTemplate() 调用已补 (e)，模板部件查找用 this.FindControl<T>(\"PART_X\")。");
+
+                node = renamed;
+            }
+            // —— 无覆盖点/已 sealed 的虚方法：保留签名 + 人工提示 ——
+            else if (isOverride && KnownMaps.OverrideMethodManualNotes.TryGetValue(name, out var manualNote))
+            {
+                WpfDetected = true;
+                Note(node, NoteSeverity.Manual, "CS-OVERRIDE-MANUAL", $"override {name}：{manualNote}");
+            }
+
             if (node.Identifier.ValueText == "OnPropertyChanged" && node.Modifiers.Any(SyntaxKind.OverrideKeyword))
             {
                 WpfDetected = true;
@@ -681,7 +808,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                     "OnPropertyChanged(DependencyPropertyChangedEventArgs) 签名不同；Avalonia 请重写 OnPropertyChanged<T>(AvaloniaPropertyChangedEventArgs<T>)。");
             }
 
-            // OnRender(DrawingContext)：custom drawing 体系差异
+            // OnRender 未被重命名的残余情况（如撞名保留原名）：提示人工
             if (node.Identifier.ValueText == "OnRender" &&
                 node.ParameterList.Parameters.Count == 1 &&
                 node.ParameterList.Parameters[0].Type?.ToString().Contains("DrawingContext") == true)
@@ -691,13 +818,58 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                     "OnRender(DrawingContext) → Avalonia 自绘需继承 CustomDrawingControl / Control + Render(DrawingContext)（context.Context），DrawingContext API（DrawGeometry/DrawRectangle 参数）与 WPF 不同，需逐调用改写。");
             }
 
-            // WPF OnApplyTemplate 在 Avalonia TemplatedControl 上存在（protected virtual），签名相同 → 保留
             return base.VisitMethodDeclaration(node);
         }
         finally
         {
             _methodNames.Pop();
         }
+    }
+
+    /// <summary>
+    /// 类级预扫描：override 方法按映射表换名后的最终名，若与类内其它方法撞名
+    /// （如 OnPreviewKeyDown+OnKeyDown 均得 OnKeyDown、或 OnMouseDown+
+    /// OnMouseLeftButtonDown 均得 OnPointerPressed → CS0111），
+    /// 则全部保留原名并输出人工合并提示，避免产出重复方法定义。
+    /// 纯原名的合法重载（参数类型不同）不处理。
+    /// </summary>
+    public override SyntaxNode? VisitClassDeclaration(ClassDeclarationSyntax node)
+    {
+        var finalNames = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var m in node.Members.OfType<MethodDeclarationSyntax>())
+        {
+            var orig = m.Identifier.ValueText;
+            // 与 VisitMethodDeclaration 判定一致：仅 override 方法参与换名
+            var final = m.Modifiers.Any(SyntaxKind.OverrideKeyword) &&
+                        KnownMaps.OverrideMethodRenames.TryGetValue(orig, out var mm)
+                ? mm.NewName
+                : orig;
+            if (!finalNames.TryGetValue(final, out var list))
+                finalNames[final] = list = new List<string>();
+            list.Add(orig);
+        }
+
+        var clash = new HashSet<string>(StringComparer.Ordinal);
+        var clashDesc = new List<string>();
+        foreach (var (final, originals) in finalNames)
+        {
+            if (originals.Count < 2 || originals.All(o => o == final)) continue;
+            foreach (var o in originals) clash.Add(o);
+            clashDesc.Add(string.Join("+", originals.OrderBy(x => x)) + "→" + final);
+        }
+
+        if (clash.Count > 0)
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Manual, "CS-OVERRIDE-CLASH",
+                "本类存在映射后重名的 override（" + string.Join("; ", clashDesc) +
+                "）：WPF 隧道/冒泡对（如 OnPreviewKeyDown+OnKeyDown）在 Avalonia 合并为单方法，"
+                + "请人工合并方法体后仅保留一个（相关方法均已保留原名，避免重复定义）。");
+        }
+
+        _clashOriginals.Push(clash);
+        try { return base.VisitClassDeclaration(node); }
+        finally { _clashOriginals.Pop(); }
     }
 
     // ------------------------------------------------------------------ 辅助
@@ -736,9 +908,72 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private static ExpressionSyntax Expr(SyntaxNode from, string code) =>
         SyntaxFactory.ParseExpression(code).WithTriviaFrom(from);
 
+    /// <summary>当前类级撞名集合（无类上下文时空集合）。</summary>
+    private HashSet<string> CurrentClashSet => _clashOriginals.Count > 0 ? _clashOriginals.Peek() : NoClashes;
+
+    /// <summary>当前遍历位置是否处于撞名保留原名的 override 方法体内（base 调用改写需跳过）。</summary>
+    private bool IsInClashMethod() =>
+        _clashOriginals.Count > 0 && _methodNames.Count > 0 &&
+        CurrentClashSet.Contains(_methodNames.Peek());
+
+    /// <summary>替换方法可访问性修饰符（public/protected），保留 override 等其余修饰符与首 token trivia。</summary>
+    private static MethodDeclarationSyntax WithAccess(MethodDeclarationSyntax m, SyntaxKind accessKind)
+    {
+        var kept = m.Modifiers.Where(t =>
+            !t.IsKind(SyntaxKind.PublicKeyword) && !t.IsKind(SyntaxKind.ProtectedKeyword) &&
+            !t.IsKind(SyntaxKind.PrivateKeyword) && !t.IsKind(SyntaxKind.InternalKeyword)).ToList();
+        var access = SyntaxFactory.Token(accessKind);
+        if (m.Modifiers.Count > 0)
+            access = access.WithTriviaFrom(m.Modifiers[0]);
+        var tokens = new List<SyntaxToken> { access };
+        tokens.AddRange(kept);
+        return m.WithModifiers(SyntaxFactory.TokenList(tokens));
+    }
+
+    /// <summary>替换参数列表第 index 个参数的类型（保留参数名/ref/默认值/trivia）。</summary>
+    private static ParameterListSyntax WithParamType(ParameterListSyntax list, int index, string typeName)
+    {
+        var old = list.Parameters[index];
+        var newType = SyntaxFactory.ParseTypeName(typeName).WithTriviaFrom(old.Type!);
+        return list.WithParameters(list.Parameters.Replace(old, old.WithType(newType)));
+    }
+
+    /// <summary>文本是否命中 WPF 独有命名空间前缀（System.Windows.Interop.X 等）。</summary>
+    private static bool TryWpfOnlyNs(string text, out string ns)
+    {
+        foreach (var candidate in KnownMaps.WpfOnlyNamespaces)
+        {
+            if (text.StartsWith(candidate + ".", StringComparison.Ordinal))
+            {
+                ns = candidate;
+                return true;
+            }
+        }
+        ns = "";
+        return false;
+    }
+
+    /// <summary>WPF 独有命名空间限定引用：保留原样 + 每命名空间一次的人工提示（返回值仅表示是否提示，勿作分支判定）。</summary>
+    private bool NoteWpfOnlyQualified(SyntaxNode node, string text)
+    {
+        if (!TryWpfOnlyNs(text, out var ns) || !_dedupe.Add("WPFONLY:" + ns)) return false;
+        WpfDetected = true;
+        Note(node, NoteSeverity.Manual, "CS-WPFONLY-REF",
+            $"{ns}.* 是 WPF 独有命名空间，Avalonia 无等价（保留原引用，需人工改写："
+            + "Interop→TopLevel.TryGetPlatformHandle/平台集成、Navigation→HyperlinkButton/路由、Media3D→无、Shell→无、Resources→AssetLoader）。");
+        return true;
+    }
+
     private QualifiedNameSyntax? RewriteQualified(QualifiedNameSyntax node, out bool changed)
     {
         var text = node.ToString();
+        // WPF 独有命名空间：保留原样（声明位置引用），仅提示（不改写，避免落入 System.Windows 前缀替换）
+        if (TryWpfOnlyNs(text, out _))
+        {
+            NoteWpfOnlyQualified(node, text);
+            changed = false;
+            return null;
+        }
         foreach (var (prefix, replacement) in QualifiedPrefixes)
         {
             if (text.StartsWith(prefix + ".", StringComparison.Ordinal) || text == prefix)

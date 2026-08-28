@@ -392,14 +392,18 @@ public static class KnownMaps
         ["Visibility"] = "bool",
     };
 
-    /// <summary>虚方法覆盖重写映射（WPF 覆盖虚方法 → Avalonia 12 虚方法）。</summary>
-    public sealed record OverrideMethodMap(string NewName, string? Param0Type);
+    /// <summary>
+    /// 虚方法覆盖重写映射（WPF 覆盖虚方法 → Avalonia 12 虚方法）。
+    /// Param0Type/Param1Type 为 null 表示保留原参数类型（已由 TypeRenames 处理）；
+    /// Access 非 null 时强制调整可访问性（Render 须 public / OnApplyTemplate 须 protected）。
+    /// </summary>
+    public sealed record OverrideMethodMap(string NewName, string? Param0Type, string? Param1Type = null, string? Access = null);
 
     /// <summary>
-    /// WPF 覆盖虚方法 → Avalonia 12 虚方法（方法名/参数 0 类型强制覆盖）。
-    /// 全部经 Avalonia 12.1.1 程序集反射验证：InputElement（指针/键盘）、
-    /// Visual（Render public）、Control（OnSizeChanged）、TemplatedControl、Window。
-    /// Param0Type 为 null 表示保留原参数类型（已由 TypeRenames 处理）。
+    /// WPF 覆盖虚方法 → Avalonia 12 虚方法（方法名/参数类型/可访问性强制覆盖）。
+    /// 全部经 Avalonia 12.1.1 反射 + 编译探针双重验证：InputElement（指针/键盘）、
+    /// Visual（Render public，protected 覆盖报 CS0507）、Control（OnSizeChanged）、
+    /// TemplatedControl（OnApplyTemplate 带参，无参覆盖报 CS0115）、Window（OnClosing）。
     /// </summary>
     public static readonly IReadOnlyDictionary<string, OverrideMethodMap> OverrideMethodRenames =
         new Dictionary<string, OverrideMethodMap>
@@ -427,18 +431,21 @@ public static class KnownMaps
             ["OnMouseDoubleClick"] = new("OnDoubleTapped", "global::Avalonia.Input.TappedEventArgs"),
             ["OnPreviewMouseDoubleClick"] = new("OnDoubleTapped", "global::Avalonia.Input.TappedEventArgs"),
             // 自绘：WPF protected OnRender(DrawingContext) → Avalonia public Render(DrawingContext)
-            ["OnRender"] = new("Render", null),
+            //（protected 覆盖 public 虚方法 → CS0507，编译探针 T3/T4 验证）
+            ["OnRender"] = new("Render", null, Access: "public"),
             // 尺寸：WPF OnRenderSizeChanged(SizeChangedInfo) → Control.OnSizeChanged(SizeChangedEventArgs)
             ["OnRenderSizeChanged"] = new("OnSizeChanged", "global::Avalonia.Controls.SizeChangedEventArgs"),
-            // 父级变化：WPF 参数 DependencyObject×2 → Visual×2
-            ["OnVisualParentChanged"] = new("OnVisualParentChanged", "global::Avalonia.Visual"),
             // Window 关闭：WPF OnClosing(CancelEventArgs) → Window.OnClosing(WindowClosingEventArgs)
             ["OnClosing"] = new("OnClosing", "global::Avalonia.Controls.WindowClosingEventArgs"),
+            // 模板应用：WPF 无参 OnApplyTemplate() → TemplatedControl.OnApplyTemplate(TemplateAppliedEventArgs)
+            //（Avalonia 12 带参 + protected；WPF public 无参覆盖 → CS0115，探针 T1/T2 验证）
+            ["OnApplyTemplate"] = new("OnApplyTemplate",
+                "global::Avalonia.Controls.Primitives.TemplateAppliedEventArgs", Access: "protected"),
         };
 
     /// <summary>
-    /// WPF 覆盖虚方法在 Avalonia 12 中无对应覆盖点：不改签名，输出人工提示
-    /// （反射验证后确认缺席的虚方法）。
+    /// WPF 覆盖虚方法在 Avalonia 12 中无对应覆盖点（或覆盖点已 sealed）：
+    /// 不改签名，输出人工提示（反射 + 编译探针验证）。
     /// </summary>
     public static readonly IReadOnlyDictionary<string, string> OverrideMethodManualNotes =
         new Dictionary<string, string>
@@ -461,6 +468,8 @@ public static class KnownMaps
             ["OnStartup"] = "Application 无 OnStartup：Avalonia 用 OnFrameworkInitializationCompleted（AppBuilder 生命周期）。",
             ["OnExit"] = "Application 无 OnExit：订阅 lifetime.Exit 事件（IClassicDesktopStyleApplicationLifetime）。",
             ["OnSessionEnding"] = "无等价：订阅 lifetime.Exit / 系统会话事件自行处理。",
+            // Layoutable.OnVisualParentChanged(Visual?, Visual?) 已 sealed：编译探针 CS0239 验证
+            ["OnVisualParentChanged"] = "Layoutable.OnVisualParentChanged 已 sealed 不可覆盖：改订阅 DetachedFromVisualTree / AttachedToVisualTree 事件。",
         };
 
     /// <summary>WPF 独有命名空间（Avalonia 无等价）：using 移除 / 限定引用保留并提示人工。</summary>
