@@ -1,14 +1,41 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
-
-  <ItemGroup>
-    <ProjectReference Include="..\WpfToAvalonia.Core\WpfToAvalonia.Core.csproj" />
-  </ItemGroup>
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- 发布名：wpf2ava -->
+    <AssemblyName>wpf2ava</AssemblyName>
+    <RootNamespace>WpfToAvalonia.Cli</RootNamespace>
+    <Version>0.1.0</Version>
+    <FileVersion>0.1.0</FileVersion>
+    <PackageVersion>0.1.0</PackageVersion>
+
+    <!-- 仓库元数据 -->
+    <RepositoryUrl>https://github.com/hebin123456/WpfToAvalonia</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/hebin123456/WpfToAvalonia</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Description>WPF → Avalonia 迁移工具：XAML 结构转换 + Roslyn AST C# 重写 + csproj/启动引导生成（.NET 10 / Avalonia 12）</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <!-- dotnet 全局工具分发：dotnet tool install -g WpfToAvalonia.Cli -->
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>wpf2ava</ToolCommandName>
+    <PackageOutputPath>./nupkg</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WpfToAvalonia.Core\WpfToAvalonia.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>

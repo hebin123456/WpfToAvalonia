@@ -19,11 +19,23 @@ samples/WpfShop                 典型 WPF 样例（MVVM + 样式 + DataGrid + �
 
 ## 使用
 
+### 获取
+
+从 [Releases](https://github.com/hebin123456/WpfToAvalonia/releases) 下载对应平台包（win-x64 / win-arm64 / linux-x64 / linux-arm64 / osx-x64 / osx-arm64，自包含单文件，解压即用），或源码构建：
+
 ```bash
 dotnet build src/WpfToAvalonia.Cli -c Release
 
 # 单工程 / 解决方案 / 目录（自动发现 csproj）
 dotnet run --project src/WpfToAvalonia.Cli -- convert <路径> [选项]
+```
+
+打包为 dotnet 全局工具（命令名 `wpf2ava`）：
+
+```bash
+dotnet pack src/WpfToAvalonia.Cli -c Release
+dotnet tool install -g wpf2ava --add-source src/WpfToAvalonia.Cli/nupkg
+wpf2ava <路径> [选项]
 ```
 
 | 选项 | 说明 |
