@@ -467,6 +467,79 @@ public class XamlTransformerTests
     }
 
     [Fact]
+    public void AdornerDecorator_Unwrap_PreservesInnerTransformations()
+    {
+        // 回归：AddBeforeSelf 对带父级节点是克隆而非移动——曾导致解包子树的转换全部丢失
+        //（留在树里的是未转换克隆副本：Hyperlink 未改名、xmlns:x 残留 → AXN0003，ForkPlus 实测）
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <Grid>
+                    <AdornerDecorator>
+                        <Hyperlink NavigateUri="https://example.com" Style="{DynamicResource S}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" RequestNavigate="H" />
+                    </AdornerDecorator>
+                </Grid>
+            </Window>
+            """);
+
+        // 解包后子树必须已转换（克隆副本曾丢失全部转换）
+        Assert.Contains("HyperlinkButton NavigateUri", r.Xaml);
+        Assert.DoesNotContain("AdornerDecorator", r.Xaml);
+        // 非根元素不得残留 xmlns 声明（AXN0003；注意 XDocument.Descendants 含根，须从根出发）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Root!.Descendants(),
+            e => e.Attributes().Any(a => a.IsNamespaceDeclaration));
+    }
+
+    [Fact]
+    public void PasswordBox_RenamesToTextBox_WithPasswordChar()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <PasswordBox x:Name="InputPasswordBox" Margin="4" />
+            </Window>
+            """);
+
+        Assert.Contains("<TextBox", r.Xaml);
+        Assert.Contains("PasswordChar=\"●\"", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-PASSWORDBOX");
+        // 显式指定时保留原值
+        var r2 = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <PasswordBox PasswordChar="*" />
+            </Window>
+            """);
+        Assert.Contains("PasswordChar=\"*\"", r2.Xaml);
+    }
+
+    [Fact]
+    public void OxyPlotNamespace_ElementsCommentedOut_RootDeclRemoved()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:oxy="http://oxyplot.org/wpf">
+                <Grid>
+                    <oxy:PlotView x:Name="LinePlot" />
+                    <TextBlock Text="keep" />
+                </Grid>
+            </Window>
+            """);
+
+        // 包已隔离：oxy 元素注释移除 + 根声明清理，其余内容保留
+        Assert.Contains("TODO(wpf2avalonia)", r.Xaml);
+        Assert.Contains("keep", r.Xaml);
+        // 存活树中无 oxy 命名空间元素（注释里保留的原始片段不算）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Root!.Descendants(), e => e.Name.NamespaceName == "http://oxyplot.org/wpf");
+        // 根元素不得再声明 oxy 命名空间。注：注释文本里保留的原始片段（el.ToString()
+        // 会内联元素用到的命名空间声明）不属于 XML 语义，不在解析树检查范围内。
+        Assert.DoesNotContain(doc.Root!.Attributes(),
+            a => a.IsNamespaceDeclaration && a.Value == "http://oxyplot.org/wpf");
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-WPF-LIB");
+    }
+
+    [Fact]
     public void Output_HasNoXmlDeclaration()
     {
         var r = Transform("""

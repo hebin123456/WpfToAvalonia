@@ -660,6 +660,66 @@ public class CSharpTransformerTests
     }
 
     [Fact]
+    public void PasswordBoxMembers_RenamedForPasswordBoxReceivers()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : Window
+                {
+                    private PasswordBox InputPasswordBox;
+                    private ViewModel Vm;
+
+                    string Read() => InputPasswordBox.Password;
+                    string VmPassword() => Vm.Password; // VM 属性不改
+                    void Wire()
+                    {
+                        // 事件名 PasswordChanged 全局改 TextChanged（WPF 独有名，含 VM 同名事件）
+                        InputPasswordBox.PasswordChanged += OnPw;
+                    }
+                    void OnPw(object s, RoutedEventArgs e) { }
+                }
+            }
+            """);
+
+        // 接收者名含 PasswordBox → .Password/.PasswordChanged 改名
+        Assert.Contains("InputPasswordBox.Text", r.Code);
+        Assert.DoesNotContain("InputPasswordBox.Password", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-PASSWORDBOX");
+        // 类型名 PasswordBox → TextBox
+        Assert.Contains("global::Avalonia.Controls.TextBox InputPasswordBox", r.Code);
+        // VM 属性 .Password：接收者不含 PasswordBox，保留原样
+        Assert.Contains("Vm.Password", r.Code);
+    }
+
+    [Fact]
+    public void PasswordChangedEvent_RenamedToTextChanged()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C
+                {
+                    void Wire(PasswordBox box)
+                    {
+                        box.PasswordChanged += OnPw;
+                    }
+                    void OnPw(object s, RoutedEventArgs e) { }
+                }
+            }
+            """);
+
+        // WPF 独有事件名全局改名（误伤面窄）
+        Assert.Contains("box.TextChanged += OnPw", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-EVENT-RENAME");
+    }
+
+    [Fact]
     public void OnPreviewMouseRightButtonDown_MapsToPointerPressed()
     {
         var r = Transform("""

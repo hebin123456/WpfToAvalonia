@@ -90,6 +90,15 @@ public sealed partial class XamlTransformer
         string? startupUri = null;
         VisitElement(root, ref usesDataGrid, ref startupUri);
 
+        // —— WPF 独有库 xmlns 根声明清理：子树全部注释移除后声明已无引用，一并去除 ——
+        foreach (var decl in root.Attributes()
+                     .Where(a => a.IsNamespaceDeclaration && KnownMaps.WpfOnlyXamlNamespaces.ContainsKey(a.Value))
+                     .ToList())
+        {
+            if (root.Descendants().All(d => d.Name.NamespaceName != decl.Value))
+                decl.Remove();
+        }
+
         var sw = new StringWriter();
         doc.Declaration = null; // Avalonia axaml 不需要 XML 声明
         doc.Save(sw, SaveOptions.None);
@@ -116,6 +125,13 @@ public sealed partial class XamlTransformer
         var ns = el.Name.NamespaceName;
         var local = el.Name.LocalName;
         var isAvaloniaNs = ns == KnownMaps.AvaloniaNs;
+
+        // —— WPF 独有控件库命名空间（包已隔离）：子树整体注释移除（元素无法解析，AXN0004） ——
+        if (!ReferenceEquals(el, _root) && KnownMaps.WpfOnlyXamlNamespaces.TryGetValue(ns, out var libNote))
+        {
+            ReplaceWithComment(el, "XAML-WPF-LIB", $"<{el.Name.LocalName}>（{libNote}）已注释移除，保持文件可编译。");
+            return;
+        }
 
         if (isAvaloniaNs)
         {
@@ -216,6 +232,16 @@ public sealed partial class XamlTransformer
                     {
                         Note(el, NoteSeverity.Manual, "XAML-RICHTEXTBOX",
                             "RichTextBox → TextBox（纯文本降级）；Document/Selection/TextRange/CaretPosition API 无等价，代码侧需人工改写（富文本可考虑 AvaloniaEdit）。");
+                    }
+
+                    // —— PasswordBox → TextBox：补 PasswordChar 掩码（WPF 默认 ●；反射验证 TextBox.PasswordChar char）——
+                    if (local == "PasswordBox")
+                    {
+                        if (el.Attribute("PasswordChar") == null)
+                            el.SetAttributeValue("PasswordChar", "●");
+                        Note(el, NoteSeverity.Info, "XAML-PASSWORDBOX",
+                            "PasswordBox → TextBox + PasswordChar=\"●\"（Avalonia 12 核心无 PasswordBox，TextBox.PasswordChar 承担掩码）；"
+                            + "代码侧 .Password → .Text、PasswordChanged → TextChanged 已由 C# 重写器同步改名（接收者名含 PasswordBox 判定）。");
                     }
 
                     if (local == "Hyperlink")
@@ -1725,7 +1751,13 @@ public sealed partial class XamlTransformer
         }
 
         foreach (var c in children)
-            el.AddBeforeSelf(c); // 依原顺序插入到包装器之前（移动语义）
+        {
+            // 先脱离父级再插入：已有父级的节点传给 AddBeforeSelf 是【克隆】而非移动
+            //（LINQ-to-XML 语义），曾导致解包子树的转换全部丢失——留在树里的是
+            // 未转换的克隆副本，转换作用在被删除的原节点上（xmlns 残留 AXN0003 实测）。
+            c.Remove();
+            el.AddBeforeSelf(c); // 依原顺序插入到包装器之前（真·移动语义）
+        }
         el.Remove();
 
         Note(first ?? el, NoteSeverity.Info, "XAML-ADORNERDECORATOR",

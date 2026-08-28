@@ -263,9 +263,31 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return node.WithName(SyntaxFactory.IdentifierName("IsVisible").WithTriviaFrom(node.Name));
         }
 
+        // —— PasswordBox 降级配套成员（接收者标识符含 PasswordBox 才改，避免误伤 VM 的 Password 属性）——
+        // <PasswordBox x:Name="XxxPasswordBox"/> 生成的字段类型已转 TextBox：.Password → .Text
+        if (node.Name.Identifier.ValueText == "Password" && ReceiverMentionsPasswordBox(node.Expression))
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-PASSWORDBOX",
+                $"{node.Expression}.Password → .Text（PasswordBox → TextBox 降级；接收者名含 PasswordBox 判定）。");
+            return node.WithName(SyntaxFactory.IdentifierName("Text").WithTriviaFrom(node.Name));
+        }
+
         ManualNote(node, text);
         return base.VisitMemberAccessExpression(node);
     }
+
+    /// <summary>
+    /// 成员访问接收者的最右标识符是否含 PasswordBox（x.Password / this.XxxPasswordBox.Password）。
+    /// 用于 PasswordBox → TextBox 降级的 .Password → .Text 改名判据（无语义模型，
+    /// 以 code-behind 字段命名约定近似，未命中者保留原样由人工处理）。
+    /// </summary>
+    private static bool ReceiverMentionsPasswordBox(ExpressionSyntax receiver) => receiver switch
+    {
+        IdentifierNameSyntax id => id.Identifier.ValueText.Contains("PasswordBox", StringComparison.OrdinalIgnoreCase),
+        MemberAccessExpressionSyntax ma => ma.Name.Identifier.ValueText.Contains("PasswordBox", StringComparison.OrdinalIgnoreCase),
+        _ => false,
+    };
 
     // ------------------------------------------------------------------ 类型名
 

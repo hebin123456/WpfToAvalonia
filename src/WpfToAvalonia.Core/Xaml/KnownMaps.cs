@@ -38,9 +38,24 @@ public static class KnownMaps
         ["Hyperlink"] = "HyperlinkButton",
         // WPF RichTextBox → TextBox 纯文本降级（Document/Selection API 需人工改写）
         ["RichTextBox"] = "TextBox",
+        // WPF PasswordBox → TextBox + PasswordChar 掩码（反射验证：Avalonia 12 核心无 PasswordBox，
+        // TextBox.PasswordChar(char) 承担掩码；.Password/.PasswordChanged 成员由 C# 重写器同步改名）
+        ["PasswordBox"] = "TextBox",
         // WPF ListView 模板行呈现器 → ContentPresenter（Avalonia.Controls.Presenters.ContentPresenter）
         ["GridViewRowPresenter"] = "ContentPresenter",
     };
+
+    /// <summary>
+    /// WPF 独有控件库的 XAML 命名空间（csproj 侧包已隔离）：子树整体注释移除 + Manual 提示。
+    /// OxyPlot.Wpf 的 http://oxyplot.org/wpf（PlotView/TrackerControl 等）对应包已隔离，
+    /// XAML 侧引用无法解析（AXN0004），注释移除保持文件可编译。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> WpfOnlyXamlNamespaces =
+        new Dictionary<string, string>
+        {
+            ["http://oxyplot.org/wpf"] =
+                "OxyPlot.Wpf（包已隔离）：图表改用 ScottPlot.Avalonia / LiveChartsCore.SkiaSharpView.Avalonia，或用 Canvas/DrawingContext 手工自绘（StatisticsUserControl 统计图表实测）",
+        };
 
     /// <summary>
     /// WPF GridView 列视图体系元素——Avalonia 核心无对应（DataGrid 是另一套机制）。
@@ -334,6 +349,8 @@ public static class KnownMaps
         // WPF 双击：Avalonia InputElement.DoubleTapped（EventHandler<TappedEventArgs>，已反射验证）
         ["MouseDoubleClick"] = "DoubleTapped",
         ["PreviewMouseDoubleClick"] = "DoubleTapped",
+        // PasswordBox → TextBox 降级配套：掩码框文本变更事件
+        ["PasswordChanged"] = "TextChanged",
     };
 
     /// <summary>右键事件需要运行时通过 PointerEventArgs 判断按键。</summary>
@@ -437,6 +454,8 @@ public static class KnownMaps
         ["ContextMenuEventArgs"] = "global::Avalonia.Input.ContextRequestedEventArgs",
         // Avalonia 12 已移除 Visibility 枚举 → bool（IsVisible）；Hidden/Collapsed 语义合并
         ["Visibility"] = "bool",
+        // WPF PasswordBox → TextBox（掩码经 PasswordChar 特性补齐；ForkPlus 2 窗口实测）
+        ["PasswordBox"] = "global::Avalonia.Controls.TextBox",
     };
 
     /// <summary>
@@ -641,6 +660,9 @@ public static class KnownMaps
         // 双击事件（XAML 侧同步重命名；处理器参数类型见 DoubleTappedArgMethods）
         ["MouseDoubleClick"] = "DoubleTapped",
         ["PreviewMouseDoubleClick"] = "DoubleTapped",
+        // PasswordBox.PasswordChanged → TextBox.TextChanged（PasswordBox → TextBox 降级配套；
+        // WPF 独有事件名，误伤面窄；ForkPlus SshPassphraseWindow 实测）
+        ["PasswordChanged"] = "TextChanged",
     };
 
     /// <summary>
