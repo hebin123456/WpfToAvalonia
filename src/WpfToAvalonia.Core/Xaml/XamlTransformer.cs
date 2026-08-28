@@ -1,4 +1,3 @@
-using System.Linq;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
@@ -15,38 +14,69 @@ public sealed class XamlTransformResult
 }
 
 /// <summary>
-/// 把 WPF XAML 转换为 Avalonia XAML：
-/// 1) 命名空间 URI 替换（文本级，零结构破坏）；
-/// 2) 基于 XDocument 的结构转换：控件/特性重命名、资产 URI、绑定表达式清理、
-///    Style/Trigger → Selector 样式与 ControlTheme、无等价物元素标记 TODO。
+/// 把 WPF XAML 转换为 Avalonia XAML。
+/// 核心架构（与 Avalonia 官方 Fluent 主题结构一致，均经编译验证）：
+/// 1) 命名空间 URI 文本替换（零结构破坏）；
+/// 2) 反编译式所有者前缀归一化（Setter/Trigger/TemplateBinding）；
+/// 3) Style → ControlTheme 体系：keyed 样式保键转 ControlTheme（引用处 Style= → Theme=），
+///    keyless 样式补 x:Key="{x:Type X}" 经资源链隐式生效（StyledElement.GetEffectiveTheme
+///    以 StyleKey 查资源）；类型键/命名 ControlTheme 均可 BasedOn={StaticResource {x:Type X}}；
+/// 4) ControlTemplate.Triggers → "^:pseudo /template/ Type#Part" 嵌套样式；
+///    Style.Triggers → "^:pseudo" 嵌套样式；MultiTrigger → 伪类链；
+/// 5) Visibility→IsVisible、Geometry→StreamGeometry、DataTemplate 迁移、资产 URI 重写。
 /// </summary>
 public sealed partial class XamlTransformer
 {
     private readonly string _assemblyName;
+    private readonly IReadOnlySet<string> _styleKeys;
+    private readonly IReadOnlySet<string> _typeThemeKeys;
+    private readonly IReadOnlySet<string> _booleanToVisibilityKeys;
+
     private readonly List<ConversionNote> _notes = new();
     private string _file = "";
+    private string _fileDir = "";
     private XElement _root = null!;
-    private bool _standaloneStylesFile;
-    private readonly List<(XElement Theme, XElement Owner)> _relocations = new();
 
-    private static readonly XNamespace XNs = "http://schemas.microsoft.com/winfx/2006/xaml";
+    private static readonly XNamespace XNs = KnownMaps.XNs;
 
     private static readonly HashSet<string> AssetAttributes = new(StringComparer.OrdinalIgnoreCase)
     { "Source", "Icon", "SelectedSource", "ImageSource", "PlaySource" };
 
-    [GeneratedRegex(@"^\{(?:Static|Dynamic)Resource\s+(?<key>[^{}]+)\}$")]
+    /// <summary>Style/Theme 引用：{StaticResource key} 或 {StaticResource {x:Type X}}。</summary>
+    [GeneratedRegex(@"^\{(?<kind>Static|Dynamic)Resource\s+(?<key>(?:\{x:Type\s+[^}]+\})|[^{}]+)\}$")]
     private static partial Regex StyleResourceRegex();
 
+    /// <summary>{TemplateBinding Path} / {TemplateBinding Path=Prop}。</summary>
+    [GeneratedRegex(@"\{TemplateBinding\s+(?:Path\s*=\s*)?(?<path>[^,}]+)\}")]
+    private static partial Regex TemplateBindingRegex();
+
+    /// <summary>绑定中的 WPF 特有选项。</summary>
     [GeneratedRegex(@"(,\s*)?(UpdateSourceTrigger|ValidatesOnDataErrors|ValidatesOnExceptions|ValidatesOnNotifyDataErrors|NotifyOnValidationError|NotifyOnSourceUpdated|NotifyOnTargetUpdated|IsAsync|BindingGroupName|BindsDirectlyToSource)\s*=\s*[^,}]*(?=[,}])")]
     private static partial Regex BindingOptionRemoval();
 
-    public XamlTransformer(string assemblyName) => _assemblyName = assemblyName;
+    /// <summary>BooleanToVisibility 转换器引用（Visibility 绑定 → IsVisible 直接绑定）。</summary>
+    [GeneratedRegex(@",?\s*Converter\s*=\s*\{(?:Static|Dynamic)Resource\s+(?<key>[^}]+)\}")]
+    private static partial Regex BindingConverterRegex();
+
+    [GeneratedRegex(@"^\{x:Type\s+(?<type>[^}]+)\}$")]
+    private static partial Regex XTypeRegex();
+
+    public XamlTransformer(string assemblyName,
+        IReadOnlySet<string>? styleKeys = null,
+        IReadOnlySet<string>? typeThemeKeys = null,
+        IReadOnlySet<string>? booleanToVisibilityKeys = null)
+    {
+        _assemblyName = assemblyName;
+        _styleKeys = styleKeys ?? new HashSet<string>();
+        _typeThemeKeys = typeThemeKeys ?? new HashSet<string>();
+        _booleanToVisibilityKeys = booleanToVisibilityKeys ?? new HashSet<string>();
+    }
 
     public XamlTransformResult Transform(string source, string relativePath)
     {
         _notes.Clear();
-        _relocations.Clear();
-        _file = relativePath;
+        _file = relativePath.Replace('\\', '/');
+        _fileDir = Path.GetDirectoryName(_file)?.Replace('\\', '/') ?? "";
 
         var text = source;
         foreach (var (oldUri, newUri) in KnownMaps.NamespaceUris)
@@ -56,45 +86,14 @@ public sealed partial class XamlTransformer
         var root = doc.Root ?? throw new InvalidOperationException("XAML 根元素缺失");
         _root = root;
 
-        // 预扫描：独立样式字典文件（根 ResourceDictionary 只含 Style），
-        // 后续会把根改为 Styles，因此无需对其中样式报"位置不生效"的 TODO。
-        _standaloneStylesFile = root.Name.LocalName == "ResourceDictionary"
-            && root.Elements().Any()
-            && root.Elements().All(e => e.Name.LocalName == "Style");
-
         bool usesDataGrid = false;
         string? startupUri = null;
         VisitElement(root, ref usesDataGrid, ref startupUri);
 
-        // 第二阶段：把无 key 的 ControlTheme / Style 从 .Resources 迁移到宿主的 .Styles
-        foreach (var (theme, owner) in _relocations)
-        {
-            var host = theme.Parent?.Parent;
-            if (host == null) continue;
-            var styles = GetOrCreateStylesCollection(host);
-            theme.Remove();
-            styles.Add(new XText("\n    "), theme, new XText("\n  "));
-        }
-
-        // 独立样式字典文件：根 ResourceDictionary 只含样式 → 根改为 Styles，
-        // 这样宿主可用 <StyleInclude> 引入且选择器全部生效（WPF 的 ResourceDictionary 无此语义）。
-        bool stylesOnly = root.Name.LocalName == "ResourceDictionary"
-            && root.Elements().Any(e => e.Name.LocalName is "Style" or "ControlTheme")
-            && root.Elements().All(e => e.Name.LocalName is "Style" or "ControlTheme" or "StyleInclude" or "ResourceInclude");
-        if (stylesOnly)
-        {
-            foreach (var s in root.Elements().Where(e => e.Name.LocalName == "Style"))
-                s.Attribute(XNs.GetName("Key"))?.Remove(); // 类选择器已自包含
-            root.Name = XName.Get("Styles", root.Name.NamespaceName);
-            Note(root, NoteSeverity.Info, "XAML-STYLES-FILE",
-                "仅含样式的 ResourceDictionary 根元素 → Styles；引用处应使用 StyleInclude（工具会同步迁移）。");
-        }
-
         var sw = new StringWriter();
-        doc.Declaration = null; // Avalonia axaml 不需要 XML 声明（utf-16 声明反而会误导解析器）
+        doc.Declaration = null; // Avalonia axaml 不需要 XML 声明
         doc.Save(sw, SaveOptions.None);
         var output = sw.ToString();
-        // 兜底：剥离可能残留的 XML 声明
         if (output.StartsWith("<?xml", StringComparison.Ordinal))
             output = output[(output.IndexOf("?>", StringComparison.Ordinal) + 2)..].TrimStart('\r', '\n');
         return new XamlTransformResult
@@ -106,42 +105,70 @@ public sealed partial class XamlTransformer
         };
     }
 
+    // ————————————————————————————————— 元素遍历 —————————————————————————————————
+
     private void VisitElement(XElement el, ref bool usesDataGrid, ref string? startupUri)
     {
         var ns = el.Name.NamespaceName;
         var local = el.Name.LocalName;
+        var isAvaloniaNs = ns == KnownMaps.AvaloniaNs;
 
-        if (ns == KnownMaps.AvaloniaNs || ns == KnownMaps.NamespaceUris.Values.First())
+        if (isAvaloniaNs)
         {
-            // —— 元素级处理 ——
+            // —— 无等价物元素：保留 + 人工提示 ——
             if (KnownMaps.UnsupportedElements.Contains(local))
             {
                 Note(el, NoteSeverity.Manual, "XAML-UNSUPPORTED-ELEMENT",
-                    $"元素 <{local}> 在 Avalonia 核心中无直接等价物，需人工替换（社区库或自定义控件）。");
+                    $"元素 <{local}> 在 Avalonia 核心中无直接等价物，需人工替换（社区库或自定义控件）。" +
+                    (local == "Hyperlink" ? "建议改用 HyperlinkButton 或 TextBlock+类样式，NavigateUri/RequestNavigate 需重写。" : ""));
             }
 
+            // —— 元素重命名 ——
             if (KnownMaps.ElementRenames.TryGetValue(local, out var renamed))
             {
-                el.Name = XName.Get(renamed, el.Name.NamespaceName);
-                Note(el, NoteSeverity.Info, "XAML-ELEMENT-RENAME", $"元素 {local} → {renamed}。");
-                if (local == "Label" && renamed == "TextBlock")
+                if (local == "Label")
                 {
-                    var content = el.Attribute("Content");
-                    if (content != null)
+                    // 有元素级内容 → ContentControl（保留 Content）；纯文本 → TextBlock（Content → Text）
+                    var hasElementContent = el.Elements().Any(e => e.Name.LocalName != "Label.Content");
+                    var target = hasElementContent ? "ContentControl" : renamed;
+                    el.Name = XName.Get(target, ns);
+                    Note(el, NoteSeverity.Info, "XAML-ELEMENT-RENAME", $"Label → {target}。");
+                    if (target == "TextBlock")
                     {
-                        content.Remove();
-                        el.SetAttributeValue("Text", content.Value);
-                        Note(el, NoteSeverity.Info, "XAML-ELEMENT-RENAME", "Label.Content → TextBlock.Text。");
+                        var content = el.Attribute("Content");
+                        if (content != null)
+                        {
+                            content.Remove();
+                            el.SetAttributeValue("Text", content.Value);
+                        }
                     }
+                    local = target;
                 }
-                local = renamed;
+                else
+                {
+                    el.Name = XName.Get(renamed, ns);
+                    if (local == "Geometry" || local == "PathGeometry")
+                    {
+                        // PathGeometry Figures（迷你语言字符串）→ StreamGeometry 内容
+                        var figures = el.Attribute("Figures");
+                        if (figures != null && !el.Elements().Any())
+                        {
+                            figures.Remove();
+                            el.Value = figures.Value;
+                        }
+                        else if (el.Elements().Any())
+                        {
+                            Note(el, NoteSeverity.Manual, "XAML-GEOMETRY",
+                                "PathGeometry 含 PathFigure 子元素，Avalonia StreamGeometry 仅支持迷你语言，需人工重写。");
+                        }
+                    }
+                    Note(el, NoteSeverity.Info, "XAML-ELEMENT-RENAME", $"{local} → {renamed}。");
+                    local = renamed;
+                }
             }
 
             if (local.StartsWith("DataGrid", StringComparison.Ordinal))
             {
-                // Avalonia 11+ 中 Avalonia.Controls.DataGrid 包把 DataGrid 类型
-                // XmlnsDefinition 到默认命名空间（https://github.com/avaloniaui），
-                // 元素无需改命名空间；仅需 csproj 引包 + App 引入 DataGrid 主题。
                 usesDataGrid = true;
                 Note(el, NoteSeverity.Info, "XAML-DATAGRID",
                     "DataGrid 使用 Avalonia.Controls.DataGrid 包（保持在默认命名空间；工具已在 App.axaml 注入主题 StyleInclude）。");
@@ -157,17 +184,25 @@ public sealed partial class XamlTransformer
                     Note(el, NoteSeverity.Info, "XAML-STARTUPURI",
                         "StartupUri 已移除；启动窗口改由 App.OnFrameworkInitializationCompleted 创建（工具已生成引导代码）。");
                 }
+                var sdm = el.Attribute("ShutdownMode");
+                if (sdm != null)
+                {
+                    sdm.Remove();
+                    Note(el, NoteSeverity.Info, "XAML-SHUTDOWNMODE",
+                        $"Application.ShutdownMode({sdm.Value}) 已移除；Avalonia 由 IClassicDesktopStyleApplicationLifetime.ShutdownMode 控制。");
+                }
                 EnsureFluentTheme(el);
             }
 
+            // FrameworkElement.Triggers：直接子元素容器（非 Style/Template 内）
             if (local == "Triggers" && el.Parent != null &&
-                el.Parent.Name.LocalName is not ("Style" or "ControlTheme"))
+                el.Parent.Name.LocalName is not ("Style" or "ControlTheme" or "ControlTemplate" or "DataTemplate"))
             {
                 Note(el, NoteSeverity.Manual, "XAML-ELEMENT-TRIGGERS",
                     "FrameworkElement.Triggers 不被 Avalonia 支持，需改写为 Style/伪类或代码。");
             }
 
-            if (local == "Storyboard" || local == "EventTrigger" || local == "BeginStoryboard")
+            if (local is "Storyboard" or "EventTrigger" or "BeginStoryboard")
             {
                 Note(el, NoteSeverity.Manual, "XAML-STORYBOARD",
                     "Storyboard/EventTrigger 动画体系不同，需改写为 Avalonia Animation/Transitions（CSS 式关键帧）。");
@@ -179,40 +214,80 @@ public sealed partial class XamlTransformer
                     "Avalonia 核心无 MultiBinding，需用多绑定转换器合并或改写为计算属性。");
             }
 
-            // 合并字典：ResourceDictionary Source → ResourceInclude（Avalonia 语法）
+            // 合并字典：带 Source 的 ResourceDictionary → ResourceInclude
             if (local == "ResourceDictionary" && el.Attribute("Source") != null)
             {
                 var src = el.Attribute("Source")!;
-                el.Name = XName.Get("ResourceInclude", el.Name.NamespaceName);
-                if (!src.Value.StartsWith('/') && !src.Value.Contains("avares", StringComparison.Ordinal) &&
-                    !src.Value.StartsWith("pack://", StringComparison.OrdinalIgnoreCase))
-                {
-                    src.Value = "/" + src.Value.TrimStart('/');
-                }
+                el.Name = XName.Get("ResourceInclude", ns);
+                src.Value = NormalizeDictionarySource(src.Value);
                 Note(el, NoteSeverity.Info, "XAML-MERGED-DICT",
-                    "带 Source 的 ResourceDictionary → ResourceInclude（Avalonia 合并字典语法）。");
+                    $"带 Source 的 ResourceDictionary → ResourceInclude，Source 归一化为 {src.Value}。");
             }
 
-            // —— 递归子元素（先处理子树，再转换自身样式语义） ——
-            foreach (var child in el.Elements().ToList())
-                VisitElement(child, ref usesDataGrid, ref startupUri);
+            // 属性元素重命名：<ListBox.ItemContainerStyle> → <ListBox.ItemContainerTheme>
+            if (local.Length > 0 && local.Contains('.') &&
+                KnownMaps.PropertyElementRenames.TryGetValue(local[(local.LastIndexOf('.') + 1)..],
+                    out var propElRenamed))
+            {
+                var newLocal = local[..(local.LastIndexOf('.') + 1)] + propElRenamed;
+                el.Name = XName.Get(newLocal, ns);
+                Note(el, NoteSeverity.Info, "XAML-PROPERTY-ELEMENT-RENAME", $"{local} → {newLocal}。");
+                local = newLocal;
+            }
 
-            // —— 特性处理 ——
-            VisitAttributes(el, ref startupUri);
+            // DropShadowEffect 属性差异：ShadowDepth → OffsetY；Direction 删除
+            if (local == "DropShadowEffect" || local == "BlurEffect")
+            {
+                foreach (var ea in el.Attributes().ToList())
+                {
+                    if (ea.IsNamespaceDeclaration) continue;
+                    if (KnownMaps.EffectAttributeRenames.TryGetValue(ea.Name.LocalName, out var effectTarget))
+                    {
+                        ea.Remove();
+                        if (effectTarget.Length > 0) el.SetAttributeValue(effectTarget, ea.Value);
+                        Note(el, NoteSeverity.Info, "XAML-EFFECT-ATTR",
+                            $"特效属性 {ea.Name.LocalName} → {(effectTarget.Length == 0 ? "（已移除）" : effectTarget)}。");
+                    }
+                }
+            }
 
-            // —— Style → Selector 样式 / ControlTheme ——
-            if (local == "Style" || local == "ControlTheme")
-                ConvertStyle(el);
-
-            return;
+            // BooleanToVisibilityConverter 资源定义：Avalonia 直接用 IsVisible 绑定，资源删除
+            if (local == "BooleanToVisibilityConverter")
+            {
+                var key = el.Attribute(XNs.GetName("Key"))?.Value;
+                el.Remove();
+                Note(el, NoteSeverity.Info, "XAML-B2V-RESOURCE",
+                    "WPF 内建 BooleanToVisibilityConverter 已移除；所有 Visibility 绑定已改为 IsVisible 直接绑定 bool。");
+                if (key != null) _ = key;
+            }
         }
 
+        // —— 递归子元素（先处理子树，再转换自身语义） ——
         foreach (var child in el.Elements().ToList())
             VisitElement(child, ref usesDataGrid, ref startupUri);
 
-        // 本地/其他命名空间元素上的事件与绑定同样需要清理
+        // —— 特性处理（所有命名空间的元素都需要） ——
         VisitAttributes(el, ref startupUri);
+
+        if (!isAvaloniaNs) return;
+
+        // —— Setter 通用归一化（Property 前缀/丢弃/Visibility 值） ——
+        if (local == "Setter")
+            NormalizeSetter(el);
+
+        // —— DataTemplate：DataType 触发器转换 + keyless 模板迁移 ——
+        if (local == "DataTemplate")
+            ConvertDataTemplateTriggers(el);
+
+        // —— Resources 内 keyless DataTemplate → 宿主 .DataTemplates ——
+        VisitResourcesContainer(el);
+
+        // —— Style → ControlTheme（含 Style.Triggers 与 ControlTemplate.Triggers） ——
+        if (local == "Style" || local == "ControlTheme")
+            ConvertStyle(el);
     }
+
+    // ————————————————————————————————— 特性处理 —————————————————————————————————
 
     private void VisitAttributes(XElement el, ref string? startupUri)
     {
@@ -220,6 +295,7 @@ public sealed partial class XamlTransformer
         {
             if (attr.IsNamespaceDeclaration) continue;
             var name = attr.Name.LocalName;
+            var value = attr.Value;
 
             // x:Uid
             if (attr.Name.Namespace == XNs && name == "Uid")
@@ -236,9 +312,39 @@ public sealed partial class XamlTransformer
                 continue;
             }
 
+            if (KnownMaps.ManualDropAttributes.TryGetValue(name, out var manualHint))
+            {
+                attr.Remove();
+                Note(el, NoteSeverity.Manual, "XAML-DROP-ATTR-MANUAL", manualHint);
+                continue;
+            }
+
+            // Visibility → IsVisible（含 BooleanToVisibility 转换器绑定）
+            if (name == "Visibility")
+            {
+                var rewritten = ConvertVisibilityValue(value, out var severity, out var message);
+                if (rewritten != null)
+                {
+                    attr.Remove();
+                    el.SetAttributeValue("IsVisible", rewritten);
+                    Note(el, severity, "XAML-VISIBILITY", message);
+                }
+                continue;
+            }
+
+            // LayoutTransform：需换 LayoutTransformControl 包装控件
+            if (name == "LayoutTransform")
+            {
+                var v = value;
+                attr.Remove();
+                Note(el, NoteSeverity.Manual, "XAML-LAYOUTTRANSFORM",
+                    $"LayoutTransform=\"{v}\" 已移除；Avalonia 需改用 LayoutTransformControl 包装该元素。");
+                continue;
+            }
+
             if (name == "WindowStyle" && el.Name.LocalName is "Window" or "WindowBase")
             {
-                var v = attr.Value.Trim();
+                var v = value.Trim();
                 if (v == "None")
                 {
                     el.SetAttributeValue("SystemDecorations", "None");
@@ -253,7 +359,7 @@ public sealed partial class XamlTransformer
                 continue;
             }
 
-            if (name == "AllowsTransparency" && attr.Value.Trim() == "True")
+            if (name == "AllowsTransparency" && value.Trim() == "True")
             {
                 attr.Remove();
                 Note(el, NoteSeverity.Manual, "XAML-TRANSPARENCY",
@@ -261,57 +367,95 @@ public sealed partial class XamlTransformer
                 continue;
             }
 
-            // 元素级样式引用：Style={StaticResource key} → Classes="key"（与定义侧 Selector="Type.key" 配对）
+            // Style={StaticResource key} → Theme={StaticResource key}（keyed 样式已统一转为 ControlTheme）
             if (name == "Style")
             {
-                var styleValue = attr.Value;
-                var m = StyleResourceRegex().Match(styleValue);
+                var m = StyleResourceRegex().Match(value);
                 if (m.Success)
                 {
-                    var cls = SanitizeClassName(m.Groups["key"].Value.Trim());
+                    var key = m.Groups["key"].Value.Trim();
                     attr.Remove();
-                    var classes = el.Attribute("Classes")?.Value;
-                    el.SetAttributeValue("Classes", string.IsNullOrWhiteSpace(classes) ? cls : $"{classes} {cls}");
-                    Note(el, NoteSeverity.Info, "XAML-STYLE-REFERENCE",
-                        $"Style=\"{{StaticResource {m.Groups["key"].Value}}}\" → Classes=\"{cls}\"（对应定义侧已改为 Selector=\"….{cls}\"）。");
-                    continue;
-                }
-                Note(el, NoteSeverity.Warning, "XAML-STYLE-REFERENCE",
-                    "Avalonia 控件没有可赋值的 Style 属性；请改用 Classes + 类选择器样式（或把控式样式放入控件 .Styles）。");
-                continue;
-            }
-
-            // 事件重命名（无命名空间属性：XML 规范中无前缀属性不继承默认 ns）
-            if (KnownMaps.XamlEventRenames.TryGetValue(name, out var ev))
-            {
-                var right = KnownMaps.RightButtonEvents.Contains(name);
-                attr.Remove();
-                if (el.Attribute(ev) != null)
-                {
-                    // 两个鼠标事件（如左键+右键）映射到同一指针事件，后者覆盖前者
-                    el.SetAttributeValue(ev, attr.Value);
-                    Note(el, NoteSeverity.Warning, "XAML-EVENT-MERGE",
-                        $"{name} 与其他鼠标事件均映射到 {ev}，仅保留 {attr.Value}；右键判断需在处理器内用 e.GetCurrentPoint(...).Properties.IsRightButton 区分。");
+                    el.SetAttributeValue("Theme", value);
+                    var known = _styleKeys.Contains(key) ||
+                                (key.StartsWith("{x:Type", StringComparison.Ordinal) && _typeThemeKeys.Contains(key));
+                    Note(el, known ? NoteSeverity.Info : NoteSeverity.Warning, "XAML-STYLE-REFERENCE",
+                        $"Style=\"{value}\" → Theme=\"{value}\"（keyed 样式已转为 ControlTheme，经 Theme 属性引用）。" +
+                        (known ? "" : "引用键未在扫描中发现，请确认其定义已转为 ControlTheme。"));
                 }
                 else
                 {
-                    el.SetAttributeValue(ev, attr.Value);
+                    attr.Remove();
+                    Note(el, NoteSeverity.Manual, "XAML-STYLE-REFERENCE",
+                        $"Style=\"{value}\" 无法转换（非资源引用）；Avalonia 控件没有 Style 属性，请人工改用 Theme/Classes。");
+                }
+                continue;
+            }
+
+            // BasedOn：x:Type 直接形式 → StaticResource 形式
+            if (name == "BasedOn" && XTypeRegex().IsMatch(value.Trim()))
+            {
+                var t = XTypeRegex().Match(value.Trim()).Groups["type"].Value.Trim();
+                attr.Value = $"{{StaticResource {{x:Type {t}}}}}";
+                Note(el, NoteSeverity.Info, "XAML-BASEDON",
+                    $"BasedOn={{x:Type {t}}} → BasedOn={{StaticResource {{x:Type {t}}}}}。");
+                continue;
+            }
+
+            // DataType（DataTemplate）：{x:Type X} → X
+            if (name == "DataType" && el.Name.LocalName == "DataTemplate")
+            {
+                var m = XTypeRegex().Match(value.Trim());
+                if (m.Success)
+                {
+                    attr.Value = m.Groups["type"].Value.Trim();
+                    Note(el, NoteSeverity.Info, "XAML-DATATYPE",
+                        $"DataTemplate.DataType {{x:Type {attr.Value}}} → {attr.Value}（Avalonia 同名属性，类型字符串直写）。");
+                }
+                continue;
+            }
+
+            // TargetType（ControlTemplate）：{x:Type X} → X
+            if (name == "TargetType" && el.Name.LocalName == "ControlTemplate")
+            {
+                var m = XTypeRegex().Match(value.Trim());
+                if (m.Success)
+                {
+                    attr.Value = m.Groups["type"].Value.Trim();
+                    Note(el, NoteSeverity.Info, "XAML-TARGETTYPE",
+                        $"ControlTemplate.TargetType {{x:Type {attr.Value}}} → {attr.Value}。");
+                }
+                continue;
+            }
+
+            // 事件重命名（无命名空间属性不继承默认 ns）
+            if (KnownMaps.XamlEventRenames.TryGetValue(name, out var ev))
+            {
+                var right = KnownMaps.RightButtonEvents.Contains(name);
+                var handler = attr.Value;
+                attr.Remove();
+                if (el.Attribute(ev) != null)
+                {
+                    el.SetAttributeValue(ev, handler);
+                    Note(el, NoteSeverity.Warning, "XAML-EVENT-MERGE",
+                        $"{name} 与其他鼠标事件均映射到 {ev}，仅保留 {handler}；右键判断需在处理器内用 e.GetCurrentPoint(...).Properties.IsRightButton 区分。");
+                }
+                else
+                {
+                    el.SetAttributeValue(ev, handler);
                     Note(el, right ? NoteSeverity.Warning : NoteSeverity.Info, "XAML-EVENT-RENAME",
                         $"事件 {name} → {ev}。" + (right ? "右键判断需改为 e.GetCurrentPoint(...).Properties.IsRightButton。" : string.Empty));
                 }
                 continue;
             }
 
-            if (el.Name.LocalName == "DataTemplate" && name == "DataType")
+            // x:Static 转换（命令→PART 部件 / RelativeSource.Self / 系统颜色键）
+            if (value.Contains("{x:Static", StringComparison.Ordinal) &&
+                ConvertXStatic(el, attr, name, value))
             {
-                attr.Remove();
-                Note(el, NoteSeverity.Warning, "XAML-DATATEMPLATE",
-                    "DataTemplate.DataType 已移除；Avalonia 用 x:DataType 做编译绑定匹配，隐式类型模板需人工调整。");
                 continue;
             }
 
-            // 值重写：资产 URI / 字体 / 资源字典 Source
-            var value = attr.Value;
+            // 值重写：资产 URI / 字体 / TemplateBinding 归一化
             if (ShouldRewriteAsset(name, value))
             {
                 var rewritten = RewriteAsset(value);
@@ -325,11 +469,18 @@ public sealed partial class XamlTransformer
                 }
             }
 
-            if (name == "Source" && value.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase))
+            if ((name == "Source" || name == "Source+") &&
+                (el.Name.LocalName is "ResourceInclude" or "ResourceDictionary" or "StyleInclude") &&
+                !value.StartsWith("avares://", StringComparison.OrdinalIgnoreCase) &&
+                !value.StartsWith("pack://", StringComparison.OrdinalIgnoreCase))
             {
-                attr.Value = Regex.Replace(value, @"\.xaml$", ".axaml", RegexOptions.IgnoreCase);
-                Note(el, NoteSeverity.Info, "XAML-RESOURCE-SOURCE", "合并字典 Source 扩展名 → .axaml。");
-                continue;
+                var rewritten = NormalizeDictionarySource(value);
+                if (rewritten != value)
+                {
+                    attr.Value = rewritten;
+                    Note(el, NoteSeverity.Info, "XAML-RESOURCE-SOURCE", $"字典 Source 归一化为 {rewritten}。");
+                    continue;
+                }
             }
 
             if (name == "FontFamily" && value.StartsWith('/'))
@@ -339,7 +490,26 @@ public sealed partial class XamlTransformer
                 continue;
             }
 
-            // 绑定表达式清理
+            // TemplateBinding 路径归一化：{TemplateBinding Border.BorderBrush} → {TemplateBinding BorderBrush}
+            if (value.Contains("{TemplateBinding", StringComparison.Ordinal))
+            {
+                var rewritten = TemplateBindingRegex().Replace(value, m =>
+                {
+                    var path = m.Groups["path"].Value.Trim();
+                    var normalized = KnownMaps.NormalizeTemplateBindingPath(path);
+                    return normalized == path ? m.Value : m.Value.Replace(path, normalized);
+                });
+                if (rewritten != value)
+                {
+                    attr.Value = rewritten;
+                    Note(el, NoteSeverity.Info, "XAML-TEMPLATEBINDING",
+                        "TemplateBinding 属性路径已剥除所有者前缀（Avalonia 按目标类型解析）。");
+                }
+                // TemplateBinding 走完后无需再清理绑定选项
+                continue;
+            }
+
+            // 绑定表达式清理（移除 WPF 特有选项）
             if (value.Contains("{Binding", StringComparison.Ordinal))
             {
                 var cleaned = BindingOptionRemoval().Replace(value, "");
@@ -352,7 +522,7 @@ public sealed partial class XamlTransformer
             }
         }
 
-        // 常规重命名表（最后应用，避免与上面的特判冲突）
+        // 常规重命名表（最后应用）
         foreach (var attr in el.Attributes().ToList())
         {
             if (attr.IsNamespaceDeclaration) continue;
@@ -366,6 +536,705 @@ public sealed partial class XamlTransformer
             }
         }
     }
+
+    /// <summary>x:Static 标记扩展转换。返回 true 表示特性已处理完毕。</summary>
+    private bool ConvertXStatic(XElement el, XAttribute attr, string name, string value)
+    {
+        // 1) RepeatButton/模板按钮 Command="{x:Static ScrollBar.XxxCommand}" → x:Name="PART_*" 部件约定
+        var m = Regex.Match(value, @"^\{x:Static\s+(?<member>[\w:.]+)\}$");
+        if (m.Success)
+        {
+            var member = m.Groups["member"].Value;
+            if (name == "Command" &&
+                KnownMaps.XStaticCommandToPart.TryGetValue(member, out var part))
+            {
+                attr.Remove();
+                if (el.Attribute(XNs.GetName("Name")) == null)
+                    el.SetAttributeValue(XNs.GetName("Name"), part);
+                Note(el, NoteSeverity.Info, "XAML-XSTATIC-COMMAND",
+                    $"Command={{x:Static {member}}} → x:Name=\"{part}\"（Avalonia 官方模板经 PART_* 部件名驱动滚动/滑块行为，无命令绑定）。");
+                return true;
+            }
+
+            if (member == "RelativeSource.Self")
+            {
+                attr.Value = "{RelativeSource Self}";
+                Note(el, NoteSeverity.Info, "XAML-XSTATIC-RELATIVESOURCE",
+                    "{x:Static RelativeSource.Self} → {RelativeSource Self}。");
+                return true;
+            }
+            return false; // 带命名空间前缀的用户静态成员（commands:Enum.X）→ Avalonia 支持，保留
+        }
+
+        // 2) {DynamicResource {x:Static SystemColors.XxxKey}} → 近似固定色
+        var sc = Regex.Match(value, @"\{(?:Static|Dynamic)Resource\s+\{x:Static\s+SystemColors\.(?<key>\w+)\}\}");
+        if (sc.Success && KnownMaps.WpfSystemColorFallbacks.TryGetValue(
+                "SystemColors." + sc.Groups["key"].Value, out var fallback))
+        {
+            attr.Value = fallback;
+            Note(el, NoteSeverity.Warning, "XAML-SYSTEMCOLOR",
+                $"{value} → {fallback}（Avalonia 无系统颜色主题键，已用 Light 主题近似色替换，请按目标平台观感复核）。");
+            return true;
+        }
+
+        // 3) PopupAnimation="{DynamicResource {x:Static SystemParameters.XxxPopupAnimationKey}}" → 删除
+        if (name == "PopupAnimation" &&
+            Regex.IsMatch(value, @"\{x:Static\s+SystemParameters\.\w*PopupAnimationKey\}"))
+        {
+            attr.Remove();
+            Note(el, NoteSeverity.Info, "XAML-POPUPANIMATION",
+                "PopupAnimation={x:Static SystemParameters.XxxPopupAnimationKey} 已移除（Avalonia Popup 无系统动画模式设置）。");
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Visibility 特性值 → IsVisible 值（含 BooleanToVisibilityConverter 绑定解包）。</summary>
+    private string? ConvertVisibilityValue(string value, out NoteSeverity severity, out string message)
+    {
+        severity = NoteSeverity.Info;
+        message = "";
+
+        // {Binding X, Converter={StaticResource BooleanToVisibility}} → {Binding X}
+        var b2v = BindingConverterRegex().Match(value);
+        if (b2v.Success && value.Contains("{Binding", StringComparison.Ordinal) &&
+            _booleanToVisibilityKeys.Contains(b2v.Groups["key"].Value.Trim()))
+        {
+            var cleaned = BindingConverterRegex().Replace(value, "").Replace(", }", " }");
+            severity = NoteSeverity.Info;
+            message = $"Visibility=\"{value}\" → IsVisible=\"{cleaned}\"（bool 直接绑定，转换器移除）。";
+            return cleaned;
+        }
+
+        var v = KnownMaps.VisibilityToIsVisible(value);
+        if (v == null) return null;
+        if (value.Trim() == "Hidden")
+        {
+            severity = NoteSeverity.Warning;
+            message = $"Visibility=Hidden → IsVisible=False（Avalonia 无布局占位的 Hidden，行为差异需复核）。";
+        }
+        else
+        {
+            message = $"Visibility={value.Trim()} → IsVisible={v}。";
+        }
+        return v;
+    }
+
+    // ————————————————————————————————— Setter 归一化 —————————————————————————————————
+
+    private void NormalizeSetter(XElement setter)
+    {
+        var propAttr = setter.Attribute("Property");
+        if (propAttr == null) return;
+        var original = propAttr.Value.Trim();
+        var normalized = KnownMaps.NormalizePropertyPath(original);
+
+        if (KnownMaps.DropSetterProperties.Contains(original) ||
+            KnownMaps.DropSetterProperties.Contains(normalized))
+        {
+            setter.Remove();
+            Note(setter, NoteSeverity.Info, "XAML-SETTER-DROP", $"Setter {original} 在 Avalonia 无对应机制，已移除。");
+            return;
+        }
+
+        if (normalized != original)
+        {
+            propAttr.Value = normalized;
+            Note(setter, NoteSeverity.Info, "XAML-SETTER-PATH", $"Setter Property {original} → {normalized}。");
+        }
+
+        // Visibility → IsVisible（值同步转换）
+        if (KnownMaps.SetterPropertyRenames.TryGetValue(normalized, out var renamed))
+        {
+            var valueAttr = setter.Attribute("Value");
+            var converted = valueAttr != null ? KnownMaps.VisibilityToIsVisible(valueAttr.Value) : null;
+            propAttr.Value = renamed;
+            if (converted != null && valueAttr != null)
+            {
+                var originalValue = valueAttr.Value;
+                valueAttr.Value = converted;
+                Note(setter, NoteSeverity.Info, "XAML-SETTER-VISIBILITY",
+                    $"Setter {original}={originalValue} → {renamed}={converted}。");
+            }
+            else
+            {
+                Note(setter, NoteSeverity.Warning, "XAML-SETTER-VISIBILITY",
+                    $"Setter Property={original} → {renamed}，但 Value 非三态 Visibility 常量，请人工复核。");
+            }
+        }
+    }
+
+    // ————————————————————————————————— Style → ControlTheme —————————————————————————————————
+
+    private void ConvertStyle(XElement style)
+    {
+        var ns = style.Name.NamespaceName;
+        var targetTypeRaw = style.Attribute("TargetType")?.Value?.Trim();
+        if (targetTypeRaw == null)
+        {
+            Note(style, NoteSeverity.Manual, "XAML-STYLE-NO-TARGETTYPE",
+                "无 TargetType 的 Style 无法转为 ControlTheme，需人工补写 TargetType。");
+            return;
+        }
+
+        var targetType = StripXType(targetTypeRaw);
+        // 目标类型同步元素重命名（Label → TextBlock）
+        if (KnownMaps.ElementRenames.TryGetValue(targetType, out var renamedType))
+        {
+            var rt = renamedType == "ContentControl" ? "TextBlock" : renamedType; // 样式目标统一按 TextBlock
+            if (rt != targetType)
+            {
+                targetType = rt;
+                Note(style, NoteSeverity.Info, "XAML-TARGETTYPE-RENAME", $"TargetType 已随元素重命名 → {targetType}。");
+            }
+        }
+
+        var keyAttr = style.Attribute(XNs.GetName("Key"));
+        var key = keyAttr?.Value?.Trim();
+        var isTypeKey = key != null && key.StartsWith("{x:Type", StringComparison.Ordinal);
+
+        style.Name = XName.Get("ControlTheme", ns);
+        style.SetAttributeValue("TargetType", targetType);
+        style.Attribute("Selector")?.Remove();
+
+        if (string.IsNullOrEmpty(key))
+        {
+            // keyless 隐式样式 → 补类型键（StyledElement 以 StyleKey 查资源得到默认主题）
+            style.SetAttributeValue(XNs.GetName("Key"), $"{{x:Type {targetType}}}");
+            Note(style, NoteSeverity.Info, "XAML-CONTROLTHEME",
+                $"隐式样式 TargetType=\"{targetType}\" → ControlTheme x:Key=\"{{x:Type {targetType}}}\"（类型键资源链隐式生效）。");
+        }
+        else
+        {
+            Note(style, NoteSeverity.Info, "XAML-CONTROLTHEME",
+                $"Style x:Key=\"{key}\" TargetType=\"{targetType}\" → ControlTheme（TargetType 定位，键与引用处 Theme= 保持不变）。");
+        }
+
+        // setter-only 命名主题：WPF 语义为主题样式叠加；自动补 BasedOn 引用同类型键主题
+        var basedOn = style.Attribute("BasedOn");
+        var hasTemplate = HasTemplateSetter(style);
+        if (basedOn == null && !isTypeKey && !hasTemplate)
+        {
+            var typeKey = $"{{x:Type {targetType}}}";
+            if (_typeThemeKeys.Contains(typeKey) || KnownMaps.DefaultThemeTypes.Contains(targetType))
+            {
+                style.SetAttributeValue("BasedOn", $"{{StaticResource {typeKey}}}");
+                Note(style, NoteSeverity.Info, "XAML-BASEDON-AUTO",
+                    $"setter-only 主题自动补 BasedOn={{StaticResource {{x:Type {targetType}}}}}（保留基础主题外观，对应 WPF 主题样式叠加语义）。");
+            }
+            else
+            {
+                Note(style, NoteSeverity.Warning, "XAML-BASEDON-MISSING",
+                    "setter-only 主题未找到可基于的基础主题；如控件需模板，请补 BasedOn 或确认模板来源。");
+            }
+        }
+
+        // Style.Triggers → ^:pseudo 嵌套样式
+        ConvertStyleTriggers(style);
+
+        // ControlTemplate.Triggers → ^:pseudo /template/ Type#Part 嵌套样式
+        var templateEl = FindControlTemplate(style);
+        if (templateEl != null)
+            ConvertTemplateTriggers(style, templateEl);
+    }
+
+    private static bool HasTemplateSetter(XElement style) =>
+        style.Elements().Any(e => e.Name.LocalName == "Setter" &&
+                                  string.Equals(e.Attribute("Property")?.Value?.Trim(), "Template", StringComparison.Ordinal));
+
+    private static XElement? FindControlTemplate(XElement style)
+    {
+        foreach (var setter in style.Elements().Where(e => e.Name.LocalName == "Setter"))
+        {
+            if (!string.Equals(setter.Attribute("Property")?.Value?.Trim(), "Template", StringComparison.Ordinal))
+                continue;
+            var direct = setter.Elements().FirstOrDefault(e => e.Name.LocalName == "ControlTemplate");
+            if (direct != null) return direct;
+            var valueEl = setter.Element(XName.Get("Setter.Value", setter.Name.NamespaceName));
+            var inner = valueEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "ControlTemplate");
+            if (inner != null) return inner;
+        }
+        return null;
+    }
+
+    private static string StripXType(string value)
+    {
+        var m = XTypeRegex().Match(value.Trim());
+        return m.Success ? m.Groups["type"].Value.Trim() : value.Trim();
+    }
+
+    // ————————————————————————————————— Style.Triggers —————————————————————————————————
+
+    private void ConvertStyleTriggers(XElement controlTheme)
+    {
+        var ns = controlTheme.Name.NamespaceName;
+        var triggersEl = controlTheme.Element(XName.Get("Style.Triggers", ns));
+        if (triggersEl == null) return;
+
+        foreach (var trigger in triggersEl.Elements().ToList())
+        {
+            var t = trigger.Name.LocalName;
+            switch (t)
+            {
+                case "Trigger":
+                {
+                    var prop = trigger.Attribute("Property")?.Value ?? "";
+                    var val = trigger.Attribute("Value")?.Value;
+                    var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+
+                    if (KnownMaps.TryGetTriggerPseudoClass(prop, val, out var pseudo) && setters.Count > 0)
+                    {
+                        // 嵌套样式必须直接放在 ControlTheme 下（而非 Style.Triggers 容器内）
+                        var nested = new XElement(XName.Get("Style", ns),
+                            new XAttribute("Selector", $"^:{pseudo}"));
+                        foreach (var s in setters)
+                            nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
+                        nested.Add(new XText("\n    "));
+                        controlTheme.Add(new XText("\n    "), nested);
+                        trigger.Remove();
+                        Note(controlTheme, NoteSeverity.Info, "XAML-TRIGGER-CONVERT",
+                            $"Trigger({KnownMaps.NormalizePropertyPath(prop)}={val}) → 嵌套 Style Selector=\"^:{pseudo}\"。");
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-TRIGGER-UNSUPPORTED",
+                            $"Trigger({prop}={val}) 无伪类等价物（如 IsDefault/IsDefaulted 或 False 值条件），需人工改写。");
+                    }
+                    break;
+                }
+                case "MultiTrigger":
+                {
+                    var conditions = trigger
+                        .Element(XName.Get("MultiTrigger.Conditions", ns))?
+                        .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
+                    var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+                    var pseudos = new List<string>();
+                    var ok = conditions.Count > 0 && setters.Count > 0;
+                    foreach (var c in conditions)
+                    {
+                        if (KnownMaps.TryGetTriggerPseudoClass(c.Attribute("Property")?.Value ?? "",
+                                c.Attribute("Value")?.Value, out var p))
+                            pseudos.Add(p);
+                        else { ok = false; break; }
+                    }
+
+                    if (ok)
+                    {
+                        var selector = "^" + string.Concat(pseudos.Select(p => ":" + p));
+                        var nested = new XElement(XName.Get("Style", ns), new XAttribute("Selector", selector));
+                        foreach (var s in setters)
+                            nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
+                        nested.Add(new XText("\n    "));
+                        controlTheme.Add(new XText("\n    "), nested);
+                        trigger.Remove();
+                        Note(controlTheme, NoteSeverity.Info, "XAML-MULTITRIGGER-CONVERT",
+                            $"MultiTrigger({string.Join(" & ", conditions.Select(c => $"{c.Attribute("Property")?.Value}={c.Attribute("Value")?.Value}"))}) → 嵌套 Style Selector=\"{selector}\"（伪类链=AND）。");
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-MULTITRIGGER",
+                            "MultiTrigger 含无伪类等价物的条件，需人工改写（伪类链或属性匹配器）。");
+                    }
+                    break;
+                }
+                case "DataTrigger":
+                {
+                    ReplaceWithComment(trigger, "XAML-DATATRIGGER",
+                        "Style 内 DataTrigger（数据条件）无选择器等价物：建议 VM 计算布尔属性 + Classes，或属性匹配器 [Prop=值]。");
+                    break;
+                }
+                case "MultiDataTrigger":
+                {
+                    ReplaceWithComment(trigger, "XAML-MULTIDATATRIGGER",
+                        "MultiDataTrigger 需人工改写：VM 计算布尔属性 + Classes 类选择器。");
+                    break;
+                }
+                case "EventTrigger":
+                {
+                    ReplaceWithComment(trigger, "XAML-EVENTTRIGGER",
+                        "样式内 EventTrigger/动画需改写为 Avalonia Animation（Style 内 Animate）或代码。");
+                    break;
+                }
+            }
+        }
+
+        // 容器内仅剩注释（TODO）时：注释移到 ControlTheme 末尾，删除容器
+        if (!triggersEl.Elements().Any())
+        {
+            foreach (var comment in triggersEl.Nodes().OfType<XComment>().ToList())
+                controlTheme.Add(new XText("\n    "), comment);
+            triggersEl.Remove();
+        }
+    }
+
+    // ————————————————————————————————— ControlTemplate.Triggers —————————————————————————————————
+
+    private void ConvertTemplateTriggers(XElement controlTheme, XElement controlTemplate)
+    {
+        var ns = controlTemplate.Name.NamespaceName;
+        var triggersEl = controlTemplate.Element(XName.Get("ControlTemplate.Triggers", ns));
+        if (triggersEl == null) return;
+
+        var partMap = BuildTemplatePartMap(controlTemplate);
+
+        foreach (var trigger in triggersEl.Elements().ToList())
+        {
+            var t = trigger.Name.LocalName;
+            switch (t)
+            {
+                case "Trigger":
+                    ConvertTemplateTrigger(controlTheme, trigger, partMap);
+                    break;
+                case "MultiTrigger":
+                    ConvertTemplateMultiTrigger(controlTheme, trigger, partMap);
+                    break;
+                case "DataTrigger":
+                case "MultiDataTrigger":
+                    ReplaceWithComment(trigger, "XAML-DATATRIGGER-TEMPLATE",
+                        "ControlTemplate 内 DataTrigger 需人工改写（模板部件的条件外观建议 Tag/Classes + 属性匹配器）。");
+                    break;
+                case "EventTrigger":
+                    ReplaceWithComment(trigger, "XAML-EVENTTRIGGER-TEMPLATE",
+                        "ControlTemplate 内 EventTrigger/动画需改写为 Avalonia Animation/Transitions。");
+                    break;
+            }
+        }
+
+        // 容器内仅剩注释（TODO）时：注释移到 ControlTheme 末尾，删除容器
+        if (!triggersEl.Elements().Any())
+        {
+            foreach (var comment in triggersEl.Nodes().OfType<XComment>().ToList())
+                controlTheme.Add(new XText("\n    "), comment);
+            triggersEl.Remove();
+        }
+    }
+
+    private void ConvertTemplateTrigger(XElement controlTheme, XElement trigger, Dictionary<string, XElement> partMap)
+    {
+        var ns = controlTheme.Name.NamespaceName;
+        var prop = trigger.Attribute("Property")?.Value ?? "";
+        var val = trigger.Attribute("Value")?.Value;
+        var sourceName = trigger.Attribute("SourceName")?.Value;
+        var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+        var hasActions = trigger.Elements().Any(e => e.Name.LocalName is "EnterActions" or "ExitActions");
+
+        var conditionPseudo = KnownMaps.TryGetTriggerPseudoClass(prop, val, out var pseudo) ? pseudo : null;
+
+        // 按 TargetName 分组生成嵌套样式
+        var groups = setters.GroupBy(s => s.Attribute("TargetName")?.Value).ToList();
+        var converted = 0;
+        var leftovers = new List<XElement>();
+
+        foreach (var group in groups)
+        {
+            var targetName = group.Key;
+            string selector;
+
+            if (targetName == null)
+            {
+                // Setter 目标 = 控件本身
+                if (conditionPseudo == null) { leftovers.AddRange(group); continue; }
+                selector = $"^:{conditionPseudo}";
+            }
+            else if (sourceName == null)
+            {
+                // 条件在控件上，Setter 打模板部件：^:pseudo /template/ Type#Part
+                if (conditionPseudo == null || !partMap.TryGetValue(targetName, out var part))
+                { leftovers.AddRange(group); continue; }
+                selector = $"^:{conditionPseudo} /template/ {PartSelector(part)}";
+            }
+            else if (sourceName == targetName)
+            {
+                // 条件与 Setter 同部件：^ /template/ Type#Part:pseudo
+                if (conditionPseudo == null || !partMap.TryGetValue(targetName, out var part))
+                { leftovers.AddRange(group); continue; }
+                selector = $"^ /template/ {PartSelector(part)}:{conditionPseudo}";
+            }
+            else
+            {
+                leftovers.AddRange(group);
+                continue;
+            }
+
+            controlTheme.Add(new XText("\n    "),
+                BuildNestedStyle(ns, selector, group));
+            converted++;
+        }
+
+        if (converted > 0)
+        {
+            Note(controlTheme, NoteSeverity.Info, "XAML-TEMPLATE-TRIGGER-CONVERT",
+                $"ControlTemplate.Triggers: Trigger({KnownMaps.NormalizePropertyPath(prop)}={val})" +
+                (sourceName != null ? $" SourceName={sourceName}" : "") +
+                $" → {converted} 个 \"/template/\" 嵌套样式。");
+        }
+
+        if (hasActions)
+            Note(trigger, NoteSeverity.Manual, "XAML-TEMPLATE-TRIGGER-ACTIONS",
+                "触发器含 EnterActions/ExitActions 动画，需改写为 Avalonia Animation/Transitions。");
+
+        if (leftovers.Count > 0 || conditionPseudo == null)
+        {
+            ReplaceWithComment(trigger, "XAML-TEMPLATE-TRIGGER-UNSUPPORTED",
+                $"Trigger({prop}={val}) 的部分条件/Setter 无选择器等价物（伪类不存在、SourceName≠TargetName 或部件未找到），已注释保留待人工处理。");
+        }
+        else
+        {
+            trigger.Remove();
+        }
+    }
+
+    private void ConvertTemplateMultiTrigger(XElement controlTheme, XElement trigger, Dictionary<string, XElement> partMap)
+    {
+        var ns = controlTheme.Name.NamespaceName;
+        var conditions = trigger
+            .Element(XName.Get("MultiTrigger.Conditions", ns))?
+            .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
+        var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+
+        var pseudos = new List<string>();
+        foreach (var c in conditions)
+        {
+            if (KnownMaps.TryGetTriggerPseudoClass(c.Attribute("Property")?.Value ?? "",
+                    c.Attribute("Value")?.Value, out var p))
+                pseudos.Add(p);
+            else
+            {
+                ReplaceWithComment(trigger, "XAML-MULTITRIGGER-TEMPLATE",
+                    "ControlTemplate 内 MultiTrigger 含无伪类等价物的条件，需人工改写。");
+                return;
+            }
+        }
+
+        if (conditions.Count == 0 || setters.Count == 0)
+        {
+            ReplaceWithComment(trigger, "XAML-MULTITRIGGER-TEMPLATE",
+                "MultiTrigger 条件或 Setter 为空，已注释保留。");
+            return;
+        }
+
+        var chained = string.Concat(pseudos.Select(p => ":" + p));
+        var groups = setters.GroupBy(s => s.Attribute("TargetName")?.Value).ToList();
+        var converted = 0;
+        foreach (var group in groups)
+        {
+            var targetName = group.Key;
+            string selector;
+            if (targetName == null)
+                selector = "^" + chained;
+            else if (!partMap.TryGetValue(targetName, out var part))
+                continue;
+            else
+                selector = "^" + chained + " /template/ " + PartSelector(part);
+
+            controlTheme.Add(new XText("\n    "), BuildNestedStyle(ns, selector, group));
+            converted++;
+        }
+
+        if (converted > 0)
+        {
+            Note(controlTheme, NoteSeverity.Info, "XAML-TEMPLATE-MULTITRIGGER-CONVERT",
+                $"ControlTemplate.MultiTrigger({string.Join(" & ", conditions.Select(c => $"{c.Attribute("Property")?.Value}={c.Attribute("Value")?.Value}"))}) → {converted} 个嵌套样式 Selector=\"{ "^" + chained }…\"。");
+        }
+        trigger.Remove();
+    }
+
+    /// <summary>克隆 Setter 并移除 TargetName（目标由选择器限定）。</summary>
+    private static XElement CloneSetterWithoutTargetName(XElement setter)
+    {
+        var clone = new XElement(setter);
+        clone.Attribute("TargetName")?.Remove();
+        return clone;
+    }
+
+    private static XElement BuildNestedStyle(string ns, string selector, IEnumerable<XElement> setters)
+    {
+        var nested = new XElement(XName.Get("Style", ns), new XAttribute("Selector", selector));
+        foreach (var s in setters)
+            nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
+        nested.Add(new XText("\n    "));
+        return nested;
+    }
+
+    /// <summary>模板部件表：x:Name → 元素（用于生成 "Type#Name" 选择器段）。</summary>
+    private static Dictionary<string, XElement> BuildTemplatePartMap(XElement controlTemplate)
+    {
+        var result = new Dictionary<string, XElement>(StringComparer.Ordinal);
+        CollectTemplatePartElements(controlTemplate, result);
+        return result;
+    }
+
+    private static void CollectTemplatePartElements(XElement el, Dictionary<string, XElement> map)
+    {
+        foreach (var child in el.Elements())
+        {
+            if (child.Name.LocalName == "ControlTemplate.Triggers") continue;
+            var name = child.Attribute(XNs.GetName("Name"))?.Value;
+            if (name != null && !map.ContainsKey(name))
+                map[name] = child;
+            CollectTemplatePartElements(child, map);
+        }
+    }
+
+    /// <summary>部件选择器段："Border#Bd"；自定义命名空间类型用 "prefix|Type#Name"。</summary>
+    private string PartSelector(XElement part)
+    {
+        var name = part.Attribute(XNs.GetName("Name"))!.Value;
+        if (part.Name.NamespaceName == KnownMaps.AvaloniaNs)
+            return $"{part.Name.LocalName}#{name}";
+
+        // 找 xmlns 前缀
+        foreach (var el in _root.DescendantsAndSelf())
+            foreach (var decl in el.Attributes())
+                if (decl.IsNamespaceDeclaration && decl.Value == part.Name.NamespaceName &&
+                    decl.Name.LocalName != "xmlns")
+                    return $"{decl.Name.LocalName}|{part.Name.LocalName}#{name}";
+        return $"{part.Name.LocalName}#{name}";
+    }
+
+    // ————————————————————————————————— DataTemplate.Triggers —————————————————————————————————
+
+    /// <summary>
+    /// DataTemplate.Triggers 的 DataTrigger：
+    /// Visibility Setter → 目标元素 IsVisible="{Binding Path}"（或 !Path）；
+    /// 其余 Setter 注释保留 + 人工提示。
+    /// </summary>
+    private void ConvertDataTemplateTriggers(XElement dataTemplate)
+    {
+        var ns = dataTemplate.Name.NamespaceName;
+        var triggersEl = dataTemplate.Element(XName.Get("DataTemplate.Triggers", ns));
+        if (triggersEl == null) return;
+
+        foreach (var trigger in triggersEl.Elements().ToList())
+        {
+            if (trigger.Name.LocalName != "DataTrigger")
+            {
+                ReplaceWithComment(trigger, "XAML-DATATEMPLATE-TRIGGER",
+                    "DataTemplate.Triggers 内非 DataTrigger 触发器需人工改写。");
+                continue;
+            }
+
+            var path = ExtractDataTriggerPath(trigger);
+            var value = trigger.Attribute("Value")?.Value?.Trim() ?? "True";
+            var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+            var converted = 0;
+
+            foreach (var setter in setters.ToList())
+            {
+                var prop = setter.Attribute("Property")?.Value?.Trim();
+                var normalized = prop != null ? KnownMaps.NormalizePropertyPath(prop) : "";
+                var setterValue = setter.Attribute("Value")?.Value?.Trim();
+
+                if (normalized == "IsVisible" && path != null &&
+                    (setterValue == "True" || setterValue == "False"))
+                {
+                    var targetName = setter.Attribute("TargetName")?.Value;
+                    var target = FindNamedElement(dataTemplate, targetName);
+                    if (target != null)
+                    {
+                        // DataTrigger 命中(path==value)时该 Setter 生效
+                        var valueIsTrue = string.Equals(value, "True", StringComparison.OrdinalIgnoreCase);
+                        var visibleOnHit = setterValue == "True";
+                        var visible = valueIsTrue == visibleOnHit;
+                        target.SetAttributeValue("IsVisible",
+                            visible ? $"{{Binding {path}}}" : $"{{Binding !{path}}}");
+                        setter.Remove();
+                        converted++;
+                    }
+                }
+            }
+
+            if (converted > 0)
+                Note(dataTemplate, NoteSeverity.Info, "XAML-DATATEMPLATE-TRIGGER-CONVERT",
+                    $"DataTemplate.Triggers: DataTrigger(Path={path}, Value={value}) 的 Visibility Setter → 目标元素 IsVisible 绑定（{converted} 处）。");
+
+            if (trigger.Elements().Any(e => e.Name.LocalName == "Setter"))
+            {
+                ReplaceWithComment(trigger, "XAML-DATATEMPLATE-TRIGGER-UNSUPPORTED",
+                    "DataTrigger 的非 Visibility Setter（外观属性）无模板级等价物：建议在 VM 增加计算属性 + Classes 类选择器。");
+            }
+            else
+            {
+                var bindingEl = trigger.Element(XName.Get("DataTrigger.Binding", ns));
+                bindingEl?.Remove();
+                trigger.Remove();
+            }
+        }
+
+        // 容器内仅剩注释（TODO）时：注释移到 DataTemplate 末尾，删除容器
+        if (!triggersEl.Elements().Any())
+        {
+            foreach (var comment in triggersEl.Nodes().OfType<XComment>().ToList())
+                dataTemplate.Add(new XText("\n    "), comment);
+            triggersEl.Remove();
+        }
+    }
+
+    private static string? ExtractDataTriggerPath(XElement dataTrigger)
+    {
+        var ns = dataTrigger.Name.NamespaceName;
+        var bindingAttr = dataTrigger.Attribute("Binding")?.Value;
+        if (bindingAttr != null)
+        {
+            var m = Regex.Match(bindingAttr, @"\{Binding\s+(?:Path\s*=\s*)?(?<path>[A-Za-z_][A-Za-z0-9_.]*)\s*\}");
+            return m.Success ? m.Groups["path"].Value : null;
+        }
+        var bindingEl = dataTrigger.Element(XName.Get("DataTrigger.Binding", ns));
+        var binding = bindingEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "Binding");
+        if (binding == null) return null;
+        var path = binding.Attribute("Path")?.Value;
+        // 复杂绑定（转换器/ElementName 等）不支持机械转换
+        if (binding.Attributes().Any(a => a.Name.LocalName is not ("Path" or "Mode"))) return null;
+        return path;
+    }
+
+    private static XElement? FindNamedElement(XElement root, string? name)
+    {
+        if (name == null) return null;
+        foreach (var el in root.Descendants())
+        {
+            if (el.Attribute(XNs.GetName("Name"))?.Value == name) return el;
+        }
+        return null;
+    }
+
+    // ————————————————————————————————— 资源容器处理 —————————————————————————————————
+
+    /// <summary>在元素遍历中调用：Resources 内 keyless DataTemplate → 宿主 DataTemplates。</summary>
+    private void VisitResourcesContainer(XElement el)
+    {
+        var isResources = el.Name.LocalName == "Resources" ||
+                          el.Name.LocalName.EndsWith(".Resources", StringComparison.Ordinal);
+        if (!isResources || el.Parent == null) return;
+
+        var keyless = el.Elements()
+            .Where(e => e.Name.LocalName == "DataTemplate" && e.Attribute(XNs.GetName("Key")) == null)
+            .ToList();
+        if (keyless.Count == 0) return;
+
+        var host = el.Parent;
+        var hostLocal = host.Name.LocalName;
+        var ns = host.Name.NamespaceName;
+
+        var dataTemplates = host.Elements().FirstOrDefault(e =>
+            e.Name.LocalName == "DataTemplates" || e.Name.LocalName == hostLocal + ".DataTemplates");
+        if (dataTemplates == null)
+        {
+            dataTemplates = new XElement(XName.Get($"{hostLocal}.DataTemplates", ns));
+            host.Add(new XText("\n    "), dataTemplates);
+        }
+
+        foreach (var dt in keyless)
+        {
+            dt.Remove();
+            dataTemplates.Add(new XText("\n      "), dt);
+        }
+        Note(host, NoteSeverity.Info, "XAML-DATATEMPLATE-RELOCATE",
+            $"{keyless.Count} 个 keyless DataTemplate 已从 {el.Name.LocalName} 迁移到 {hostLocal}.DataTemplates（Avalonia 隐式数据模板的生效位置）。");
+    }
+
+    // ————————————————————————————————— 资产 URI —————————————————————————————————
 
     private static bool ShouldRewriteAsset(string attrName, string value) =>
         value.StartsWith("pack://application", StringComparison.OrdinalIgnoreCase) ||
@@ -381,198 +1250,47 @@ public sealed partial class XamlTransformer
         return value;
     }
 
-    /// <summary>Style TargetType → Selector；Trigger → 伪类样式；模板样式 → ControlTheme。</summary>
-    private void ConvertStyle(XElement style)
+    /// <summary>
+    /// 字典 Source 归一化：pack URI → avares；相对路径 → 以程序集根为基准的 / 绝对路径；
+    /// .xaml → .axaml。
+    /// </summary>
+    private string NormalizeDictionarySource(string source)
     {
-        var ns = style.Name.NamespaceName;
-        var targetType = style.Attribute("TargetType")?.Value?.Trim();
-
-        if (targetType == null)
+        var src = source.Trim();
+        if (src.StartsWith("pack://", StringComparison.OrdinalIgnoreCase))
+            src = RewriteAsset(src);
+        if (src.StartsWith("avares://", StringComparison.OrdinalIgnoreCase) ||
+            src.StartsWith("http", StringComparison.OrdinalIgnoreCase) ||
+            src.StartsWith("resm:", StringComparison.OrdinalIgnoreCase))
         {
-            if (style.Attribute("Selector") == null)
-                Note(style, NoteSeverity.Manual, "XAML-STYLE-NO-TARGETTYPE",
-                    "无 TargetType 的 Style 无法推断 Selector，需人工补写 Selector。");
-            return;
+            return Regex.Replace(src, @"\.xaml$", ".axaml", RegexOptions.IgnoreCase);
         }
-
-        // WPF 中 keyed 样式仅通过 Style={StaticResource key} 应用；Avalonia 等价物是
-        // 类选择器：定义侧 Selector="Type.key"，使用侧 Classes="key"。
-        var keyAttr = style.Attribute(XNs.GetName("Key"));
-        var key = keyAttr?.Value?.Trim();
-        var baseType = targetType.Replace(':', '|');
-        var selector = string.IsNullOrEmpty(key) ? baseType : $"{baseType}.{SanitizeClassName(key!)}";
-        style.SetAttributeValue("Selector", selector);
-        style.Attribute("TargetType")?.Remove();
-        Note(style, NoteSeverity.Info, "XAML-STYLE-SELECTOR",
-            key is { Length: > 0 }
-                ? $"keyed 样式 TargetType=\"{targetType}\" x:Key=\"{key}\" → Selector=\"{selector}\"（引用处改为 Classes）。"
-                : $"Style TargetType=\"{targetType}\" → Selector=\"{selector}\"。");
-
-        var basedOn = style.Attribute("BasedOn");
-        if (basedOn != null && basedOn.Value.Contains("x:Type"))
-            Note(style, NoteSeverity.Warning, "XAML-BASEDON",
-                "BasedOn 基于 x:Type 的默认样式查找不被支持；Avalonia 用 ControlTheme + BasedOn=\"^...\" 或 StaticResource，请复核。");
-
-        // Trigger → 嵌套伪类样式（Selector="^:pseudo" 引用父选择器，keyed 样式同样生效）
-        var triggersEl = style.Element(XName.Get("Style.Triggers", ns)) ?? style.Element(XName.Get("ControlTheme.Triggers", ns));
-        if (triggersEl != null)
+        if (!src.StartsWith('/'))
         {
-            foreach (var trigger in triggersEl.Elements().ToList())
-            {
-                var t = trigger.Name.LocalName;
-                if (t == "Trigger")
-                {
-                    var prop = trigger.Attribute("Property")?.Value?.Trim();
-                    var val = trigger.Attribute("Value")?.Value?.Trim();
-                    if (prop != null && KnownMaps.TriggerPseudoClasses.TryGetValue(prop, out var pseudo) &&
-                        KnownMaps.TriggerValueMatches(prop, val ?? "True"))
-                    {
-                        var nested = new XElement(XName.Get("Style", ns),
-                            new XAttribute("Selector", $"^:{pseudo}"));
-                        foreach (var n in trigger.Nodes())
-                            if (n is XElement e && e.Name.LocalName is "Setter" or "Setter.Value")
-                                nested.Add(new XText("\n        "), new XElement(e));
-                        nested.Add(new XText("\n      "));
-                        CleanBindingsDeep(nested);
-                        // 插到最后一个 Setter/嵌套样式之后
-                        var last = style.Elements().LastOrDefault(e => e.Name.LocalName is "Setter" or "Style") ?? triggersEl;
-                        last.AddAfterSelf(new XText("\n      "), nested);
-                        trigger.Remove();
-                        Note(style, NoteSeverity.Info, "XAML-TRIGGER-CONVERT",
-                            $"Trigger({prop}={val}) → 嵌套 Style Selector=\"^:{pseudo}\"。");
-                    }
-                    else
-                    {
-                        Note(trigger, NoteSeverity.Manual, "XAML-TRIGGER-UNSUPPORTED",
-                            $"Trigger({prop}={val}) 无法映射为伪类选择器，需人工改写（可用 Classes + 选择器）。");
-                    }
-                }
-                else if (t == "DataTrigger")
-                {
-                    Note(trigger, NoteSeverity.Manual, "XAML-DATATRIGGER",
-                        "DataTrigger 需人工改写：数据条件样式建议在 VM 计算布尔属性 + Classes，或用 Classes 选择器。");
-                }
-                else if (t == "MultiTrigger" || t == "MultiDataTrigger")
-                {
-                    Note(trigger, NoteSeverity.Manual, "XAML-MULTITRIGGER",
-                        "MultiTrigger 无等价物，需拆分为多个伪类样式或人工改写。");
-                }
-                else if (t == "EventTrigger")
-                {
-                    Note(trigger, NoteSeverity.Manual, "XAML-EVENTTRIGGER",
-                        "样式内 EventTrigger/动画需改写为 Avalonia Animation（Style 内 Animate）或代码。");
-                }
-                else if (t == "Setter")
-                {
-                    continue; // 触发器容器中的 Setter 不常见，忽略
-                }
-            }
-
-            if (!triggersEl.Elements().Any() && !triggersEl.Attributes().Any())
-                triggersEl.Remove();
+            // 相对当前文件目录解析 → 根路径
+            var combined = _fileDir.Length == 0 ? src : $"{_fileDir}/{src}";
+            src = "/" + NormalizeRelative(combined);
         }
-
-        // 模板样式 → ControlTheme，并在需要时迁移到 .Styles
-        var hasTemplate = style.Elements().Any(e =>
-            e.Name.LocalName == "Setter" && string.Equals(e.Attribute("Property")?.Value?.Trim(), "Template", StringComparison.Ordinal));
-
-        if (hasTemplate)
-        {
-            // ControlTheme 在 Avalonia 中用 TargetType 而非 Selector 定位控件类型
-            style.Name = XName.Get("ControlTheme", ns);
-            style.SetAttributeValue("TargetType", targetType);
-            style.Attribute("Selector")?.Remove();
-            // ControlTheme 不参与类选择器，也不需要 x:Key 之外的类映射
-            Note(style, NoteSeverity.Info, "XAML-CONTROLTHEME",
-                $"含 Template 的 Style → ControlTheme TargetType=\"{targetType}\"（Avalonia 11+ 控件主题机制）。");
-
-            // ControlTheme 必须位于 Styles 集合中；迁移到宿主 .Styles
-            var parentName = style.Parent?.Name.LocalName;
-            if (IsResourcesContainer(parentName))
-            {
-                var owner = style.Parent!;
-                if (owner.Parent != null)
-                {
-                    _relocations.Add((style, owner));
-                    Note(style, NoteSeverity.Info, "XAML-THEME-RELOCATE",
-                        "无 key 的默认控件样式已从 Resources 迁移到宿主 .Styles 集合。");
-                }
-                else if (!_standaloneStylesFile)
-                {
-                    Note(style, NoteSeverity.Manual, "XAML-THEME-LOCATION",
-                        "独立资源字典文件中的无 key 样式在 Avalonia 中不会自动生效；请移入 App.axaml 的 Application.Styles（可用 StyleInclude 引入）。");
-                }
-            }
-        }
-        else
-        {
-            // 无模板的样式（含 keyed 类选择器样式）也需在 Styles 集合中才能生效
-            var parentName = style.Parent?.Name.LocalName;
-            if (IsResourcesContainer(parentName))
-            {
-                if (style.Parent!.Parent != null)
-                {
-                    keyAttr?.Remove(); // 类选择器已自包含，key 不再需要
-                    _relocations.Add((style, style.Parent!));
-                    Note(style, NoteSeverity.Info, "XAML-STYLE-RELOCATE",
-                        "样式已迁移到宿主 .Styles 集合（Avalonia 样式必须放在 Styles 中才会生效；keyed 样式通过 Classes 匹配）。");
-                }
-                else if (!_standaloneStylesFile)
-                {
-                    Note(style, NoteSeverity.Manual, "XAML-STYLE-LOCATION",
-                        "独立资源字典文件中的样式在 Avalonia 中不会自动生效；请移入 Application.Styles 或用 StyleInclude 引入。");
-                }
-            }
-        }
+        return Regex.Replace(src, @"\.xaml$", ".axaml", RegexOptions.IgnoreCase);
     }
 
-    /// <summary>资源容器判定：兼容 "Resources"、"ResourceDictionary" 与 "Window.Resources" 点式属性元素。</summary>
-    private static bool IsResourcesContainer(string? parentName) =>
-        parentName == "ResourceDictionary" ||
-        parentName == "Resources" ||
-        (parentName?.EndsWith(".Resources", StringComparison.Ordinal) ?? false);
-
-    /// <summary>CSS 类名合法字符（Avalonia 选择器类名限制）：非 [A-Za-z0-9_-] 一律替换为 '-'。</summary>
-    private static string SanitizeClassName(string name) =>
-        Regex.Replace(name, @"[^A-Za-z0-9_\-]", "-");
-
-    /// <summary>对新增节点的后代特性统一做绑定表达式清理与资产 URI 重写。</summary>
-    private void CleanBindingsDeep(XElement root)
+    private static string NormalizeRelative(string path)
     {
-        foreach (var el in root.DescendantsAndSelf())
+        var stack = new List<string>();
+        foreach (var seg in path.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (var attr in el.Attributes())
+            if (seg == ".") continue;
+            if (seg == "..")
             {
-                if (attr.IsNamespaceDeclaration) continue;
-                var value = attr.Value;
-                if (value.Contains("{Binding", StringComparison.Ordinal))
-                {
-                    var cleaned = BindingOptionRemoval().Replace(value, "");
-                    if (cleaned != value) attr.Value = cleaned;
-                }
-                if (ShouldRewriteAsset(attr.Name.LocalName, value))
-                    attr.Value = RewriteAsset(value);
+                if (stack.Count > 0) stack.RemoveAt(stack.Count - 1);
+                continue;
             }
+            stack.Add(seg);
         }
+        return string.Join("/", stack);
     }
 
-    /// <summary>查找宿主的 .Styles 集合（兼容 "Styles" 与 "Window.Styles" 两种属性元素写法）。</summary>
-    private static XElement? FindStylesCollection(XElement host)
-    {
-        var hostLocal = host.Name.LocalName;
-        return host.Elements().FirstOrDefault(e =>
-            e.Name.LocalName == "Styles" || e.Name.LocalName == hostLocal + ".Styles");
-    }
-
-    private static XElement GetOrCreateStylesCollection(XElement host)
-    {
-        var found = FindStylesCollection(host);
-        if (found != null) return found;
-        var created = new XElement(
-            XName.Get($"{host.Name.LocalName}.Styles", host.Name.NamespaceName), new XText("\n    "));
-        host.Add(new XText("\n    "), created);
-        return created;
-    }
+    // ————————————————————————————————— App 主题注入 —————————————————————————————————
 
     /// <summary>保证 App.axaml 含 FluentTheme（否则控件无默认外观）。</summary>
     private void EnsureFluentTheme(XElement app)
@@ -588,6 +1306,28 @@ public sealed partial class XamlTransformer
         else styles.Add(theme);
         Note(app, NoteSeverity.Info, "XAML-FLUENTTHEME",
             "已添加 <FluentTheme />（Avalonia 控件需要主题才有默认外观；如需 WPF 经典观感可换 SimpleTheme）。");
+    }
+
+    private static XElement GetOrCreateStylesCollection(XElement host)
+    {
+        var hostLocal = host.Name.LocalName;
+        var found = host.Elements().FirstOrDefault(e =>
+            e.Name.LocalName == "Styles" || e.Name.LocalName == hostLocal + ".Styles");
+        if (found != null) return found;
+        var created = new XElement(
+            XName.Get($"{host.Name.LocalName}.Styles", host.Name.NamespaceName), new XText("\n    "));
+        host.Add(new XText("\n    "), created);
+        return created;
+    }
+
+    // ————————————————————————————————— 工具 —————————————————————————————————
+
+    private void ReplaceWithComment(XElement el, string rule, string message)
+    {
+        var comment = new XComment("\n      TODO(wpf2avalonia): " + message + "\n      原始片段：\n      " +
+                                   el.ToString().Trim().Replace("\n", "\n      ") + "\n    ");
+        el.ReplaceWith(comment);
+        Note(el, NoteSeverity.Manual, rule, message);
     }
 
     private void Note(XObject node, NoteSeverity severity, string rule, string message)

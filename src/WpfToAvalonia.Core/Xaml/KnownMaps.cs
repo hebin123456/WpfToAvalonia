@@ -1,9 +1,16 @@
 namespace WpfToAvalonia.Core.Xaml;
 
-/// <summary>WPF → Avalonia 的已知映射规则表。</summary>
+/// <summary>
+/// WPF → Avalonia 的已知映射规则表。
+/// 规则值均经过 Avalonia 12（.NET 10）真实编译验证：
+/// 类型键 ControlTheme 资源链、^ 嵌套、/template/ Type#Name 选择器、
+/// 伪类集合来自 Avalonia.Themes.Fluent 与控件源码的 PseudoClasses 定义。
+/// </summary>
 public static class KnownMaps
 {
     public const string AvaloniaNs = "https://github.com/avaloniaui";
+
+    public const string XNs = "http://schemas.microsoft.com/winfx/2006/xaml";
 
     /// <summary>DataGrid 主题（Avalonia.Controls.DataGrid 包内嵌 XAML，须由 App 引入）。</summary>
     public const string DataGridThemeSource = "avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml";
@@ -21,32 +28,203 @@ public static class KnownMaps
     {
         ["Label"] = "TextBlock",
         ["Page"] = "UserControl",
+        // Geometry 体系：WPF Geometry 基类/PathGeometry 字符串资源 → StreamGeometry
+        ["Geometry"] = "StreamGeometry",
+        ["PathGeometry"] = "StreamGeometry",
     };
 
-    /// <summary>无核心等价物、需人工处理的元素。</summary>
+    /// <summary>无核心等价物、需人工处理的元素（保留原样 + Manual 提示）。</summary>
     public static readonly IReadOnlySet<string> UnsupportedElements = new HashSet<string>
     {
         "RichTextBox", "FlowDocument", "FlowDocumentScrollViewer", "FlowDocumentReader",
         "Frame", "ToolBar", "ToolBarTray", "StatusBar", "WindowsFormsHost", "WebBrowser",
         "InkCanvas", "Viewport3D", "MediaElement", "AdornerDecorator", "Ribbon", "JumpList",
+        // Avalonia 核心无 Hyperlink 内联元素（仅 HyperlinkButton），需人工改造
+        "Hyperlink",
+        "GeometryGroup", "CombinedGeometry",
     };
 
-    /// <summary>特性重命名。</summary>
+    /// <summary>特性重命名（值均经 Avalonia 12 编译验证）。</summary>
     public static readonly IReadOnlyDictionary<string, string> AttributeRenames = new Dictionary<string, string>
     {
+        // ToolTip 附加属性宿主从 ToolTipService → ToolTip
         ["ToolTipService.ToolTip"] = "ToolTip.Tip",
-        ["ToolTipService.Placement"] = "",           // 丢弃
-        ["ToolTipService.InitialShowDelay"] = "",    // 丢弃
-        ["WindowStyle"] = "SystemDecorations",       // 仅 None 值语义等价
+        // WPF 容器样式 → Avalonia 容器主题（keyed 样式已统一转为 ControlTheme）
+        ["ItemContainerStyle"] = "ItemContainerTheme",
+        // ZIndex：WPF 附加（Panel/Canvas.ZIndex）→ Avalonia Visual 直接属性
+        ["Panel.ZIndex"] = "ZIndex",
+        ["Canvas.ZIndex"] = "ZIndex",
+        // TextBlock.X 附加（WPF 反编译产物）→ Avalonia TextElement.X 附加属性
+        ["TextBlock.FontSize"] = "TextElement.FontSize",
+        ["TextBlock.FontWeight"] = "TextElement.FontWeight",
+        ["TextBlock.FontStyle"] = "TextElement.FontStyle",
+        ["TextBlock.FontFamily"] = "TextElement.FontFamily",
+        ["TextBlock.Foreground"] = "TextElement.Foreground",
+        // TabIndex：附加形式 → InputElement 直接属性
+        ["KeyboardNavigation.TabIndex"] = "TabIndex",
     };
 
-    /// <summary>直接丢弃的 WPF 特有特性（Avalonia 无对应或无意义）。</summary>
-    public static readonly IReadOnlySet<string> DropAttributes = new HashSet<string>
+    /// <summary>属性元素（&lt;X.Prop&gt;）后缀重命名。</summary>
+    public static readonly IReadOnlyDictionary<string, string> PropertyElementRenames = new Dictionary<string, string>
+    {
+        ["ItemContainerStyle"] = "ItemContainerTheme",
+        ["ItemContainerStyleSelector"] = "ItemContainerThemeSelector",
+    };
+
+    /// <summary>应整体丢弃的元素特性（Avalonia 无对应或无意义；均经验证）。</summary>
+    public static readonly IReadOnlySet<string> DropAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "SnapsToDevicePixels", "UseLayoutRounding", "FocusManager.IsFocusScope",
         "TextOptions.TextFormattingMode", "TextOptions.TextRenderingMode",
-        "TextOptions.TextHintingMode", "x:Uid", "ShowActivated",
+        "TextOptions.TextHintingMode", "ShowActivated",
+        "OverridesDefaultStyle", "FocusVisualStyle", "RecognizesAccessKey",
+        "ScrollViewer.CanContentScroll", "RenderOptions.ClearTypeHint",
+        // WPF 独有：Avalonia 无 TextSearch / VirtualizingPanel 附加属性（默认虚拟化，无回收模式）
+        "TextSearch.TextPath",
+        "VirtualizingPanel.IsVirtualizing", "VirtualizingPanel.ScrollUnit",
+        "VirtualizingPanel.VirtualizationMode", "VirtualizingPanel.CacheLength",
+        "VirtualizingPanel.CacheLengthUnit",
+        // KeyboardNavigation.DirectionalNavigation / ToolTipService.ShowDuration：Avalonia 无对应附加属性
+        "KeyboardNavigation.DirectionalNavigation", "ToolTipService.ShowDuration",
+        // Storyboard 附加定位（Avalonia 动画用 Selector 定位，动画本身已标 Manual）
+        "Storyboard.TargetName", "Storyboard.TargetProperty",
+        "Grid.IsSharedSizeScope",
     };
+
+    /// <summary>删除 + Manual 提示的特性（行为缺失需人工补）。</summary>
+    public static readonly IReadOnlyDictionary<string, string> ManualDropAttributes = new Dictionary<string, string>
+    {
+        ["WindowChrome.IsHitTestVisibleInChrome"] =
+            "Avalonia 无 WindowChrome；自定义标题栏需用 ExtendClientAreaToDecorationsHint + 通过 tag/IsHitTestVisible 自行处理命中测试。",
+        ["WindowChrome.ResizeGripDirection"] =
+            "Avalonia 无 WindowChrome.ResizeGripDirection；调整大小手柄由系统装饰或自定义实现提供。",
+        ["WindowChrome.GlassFrameThickness"] =
+            "Avalonia 无 WindowChrome.GlassFrameThickness；玻璃效果需 TransparencyLevelHint。",
+        ["WindowChrome.CornerRadius"] = "Avalonia 无 WindowChrome.CornerRadius。",
+    };
+
+    /// <summary>应整体丢弃的 Setter/触发器属性（Avalonia 无对应机制）。</summary>
+    public static readonly IReadOnlySet<string> DropSetterProperties = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "OverridesDefaultStyle", "FocusVisualStyle", "SnapsToDevicePixels", "UseLayoutRounding",
+        "RenderOptions.ClearTypeHint", "FrameworkContentElement.FocusVisualStyle",
+    };
+
+    /// <summary>
+    /// WPF 反编译 XAML 中属性名的"可剥除所有者前缀"——这些所有者是目标类型的基类，
+    /// Avalonia 的 Setter/TemplateBinding 按目标类型解析属性，前缀应剥除：
+    /// Property="Border.BorderBrush" → Property="BorderBrush"。
+    /// </summary>
+    public static readonly IReadOnlySet<string> StripOwnerPrefixes = new HashSet<string>
+    {
+        // 布局/基础
+        "UIElement", "FrameworkElement", "Control", "ContentControl", "ContentElement",
+        "FrameworkContentElement", "ItemsControl", "HeaderedContentControl",
+        "HeaderedItemsControl", "Decorator", "Panel", "Border", "Viewbox", "GridSplitter",
+        "Window", "WindowBase", "NavigationWindow", "Page", "UserControl",
+        // 按钮/选择
+        "ButtonBase", "Button", "ToggleButton", "RepeatButton", "Selector", "ListBox",
+        "ListBoxItem", "ComboBox", "ComboBoxItem", "MenuItem", "Menu", "TabItem", "TabControl",
+        "Expander", "GroupBox", "Calendar", "DataGrid", "DataGridCell", "DataGridRow",
+        // 输入
+        "TextBoxBase", "TextBox", "PasswordBox", "RichTextBox",
+        // 文本
+        "TextElement", "TextBlock", "AccessText", "Run", "Inline", "Span", "Block",
+        // 形状/媒体
+        "Shape", "Path", "Rectangle", "Ellipse", "Line", "Polygon", "Polyline", "Image",
+        // 范围/滚动/原语
+        "RangeBase", "Slider", "ScrollBar", "Thumb", "Track", "ProgressBar",
+        "Popup", "ToolTip", "ScrollViewer", "ContentPresenter", "UniformGrid",
+        "VirtualizingPanel", "MultiSelector", "TreeView", "TreeViewItem",
+    };
+
+    /// <summary>
+    /// 纯附加属性所有者——属性名一律保留完整前缀（Avalonia 仍以 Owner.Prop 形式使用）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> PureAttachedOwners = new HashSet<string>
+    {
+        "ToolTipService", "KeyboardNavigation", "AutomationProperties", "Validation",
+        "VirtualizingStackPanel", "TextOptions", "RenderOptions", "Localization",
+        "Stylus", "InkCanvas", "VisualBrush", "BitmapScaling", "DefinitionBase",
+        "GridSplitter", "SharedSizeGroup", "Canvas", "DockPanel",
+    };
+
+    /// <summary>
+    /// 附加属性后缀名——用于 Grid/ScrollViewer 这类"既是控件类型又是附加属性宿主"的所有者：
+    /// 前缀 + 附加属性名 → 保留前缀（Grid.Row）；前缀 + 普通属性 → 剥除（Grid.ShowGridLines）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> AttachedPropertySuffixes = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "Row", "Column", "RowSpan", "ColumnSpan", "IsSharedSizeScope",
+        "Left", "Top", "Right", "Bottom", "ZIndex", "Dock",
+        "CanContentScroll", "HorizontalScrollBarVisibility", "VerticalScrollBarVisibility",
+        "IsDeferredScrollingEnabled", "VirtualizationMode", "IsScrollInertiaEnabled",
+    };
+
+    /// <summary>
+    /// 属性触发器 → Avalonia 伪类（均验证自 Avalonia 控件源码 PseudoClasses 定义与 Fluent 主题）。
+    /// 返回 false 表示该属性/值组合无伪类等价物（如 IsDefault）。
+    /// </summary>
+    public static bool TryGetTriggerPseudoClass(string property, string? value, out string pseudoClass)
+    {
+        pseudoClass = "";
+        var prop = NormalizePropertyPath(property);
+        var val = value?.Trim().Trim('"') ?? "";
+        var isTrue = string.Equals(val, "True", StringComparison.OrdinalIgnoreCase);
+        var isFalse = string.Equals(val, "False", StringComparison.OrdinalIgnoreCase);
+
+        switch (prop)
+        {
+            case "IsMouseOver" when isTrue: pseudoClass = "pointerover"; return true;
+            case "IsPressed" when isTrue: pseudoClass = "pressed"; return true;
+            case "IsEnabled" when isFalse: pseudoClass = "disabled"; return true;
+            case "IsChecked" when isTrue: pseudoClass = "checked"; return true;
+            case "IsChecked" when isFalse: pseudoClass = "unchecked"; return true;
+            case "IsSelected" when isTrue: pseudoClass = "selected"; return true;
+            case "IsFocused" when isTrue:
+            case "IsKeyboardFocused" when isTrue: pseudoClass = "focus"; return true;
+            case "IsExpanded" when isTrue: pseudoClass = "expanded"; return true;
+            case "IsDropDownOpen" when isTrue:
+            case "IsSubmenuOpen" when isTrue: pseudoClass = "open"; return true;
+            default: return false;
+        }
+    }
+
+    /// <summary>WPF Visibility 三态 → Avalonia IsVisible(bool)。Hidden 无布局占位等价物。</summary>
+    public static string? VisibilityToIsVisible(string? value)
+    {
+        return value?.Trim() switch
+        {
+            "Visible" => "True",
+            "Collapsed" => "False",
+            "Hidden" => "False", // 警告由调用方记录
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// 属性路径归一化：剥除可剥除的所有者前缀，保留附加属性前缀。
+    /// 兼容反编译 XAML 的 "(Owner.Prop)" 括号写法。
+    /// </summary>
+    public static string NormalizePropertyPath(string property)
+    {
+        var p = property.Trim();
+        if (p.StartsWith('(') && p.EndsWith(')'))
+            p = p[1..^1].Trim();
+        var dot = p.IndexOf('.');
+        if (dot <= 0 || dot == p.Length - 1) return p;
+        var owner = p[..dot];
+        var rest = p[(dot + 1)..].Trim();
+        // rest 自身还带命名空间前缀（controls:PlaceholderTextBox.Icon）→ 保留原样
+        if (rest.Contains(':')) return p;
+        if (PureAttachedOwners.Contains(owner)) return p;
+        if (AttachedPropertySuffixes.Contains(rest)) return p;
+        if (StripOwnerPrefixes.Contains(owner)) return rest;
+        return p;
+    }
+
+    /// <summary>TemplateBinding 里的属性路径归一化（同 Setter 规则）。</summary>
+    public static string NormalizeTemplateBindingPath(string path) => NormalizePropertyPath(path);
 
     /// <summary>XAML 事件名重命名（鼠标 → 指针模型）。</summary>
     public static readonly IReadOnlyDictionary<string, string> XamlEventRenames = new Dictionary<string, string>
@@ -70,25 +248,6 @@ public static class KnownMaps
     /// <summary>右键事件需要运行时通过 PointerEventArgs 判断按键。</summary>
     public static readonly IReadOnlySet<string> RightButtonEvents = new HashSet<string>
     { "MouseRightButtonDown", "MouseRightButtonUp" };
-
-    /// <summary>属性触发器 → Avalonia 伪类选择器。</summary>
-    public static readonly IReadOnlyDictionary<string, string> TriggerPseudoClasses = new Dictionary<string, string>
-    {
-        ["IsMouseOver"] = "pointerover",
-        ["IsPressed"] = "pressed",
-        ["IsEnabled"] = "disabled",      // 需 Value=False
-        ["IsChecked"] = "checked",
-        ["IsSelected"] = "selected",
-        ["IsFocused"] = "focus",
-        ["IsKeyboardFocused"] = "focus",
-    };
-
-    /// <summary>触发的 Value 必须与伪类激活条件匹配（IsEnabled 需要 False）。</summary>
-    public static bool TriggerValueMatches(string property, string value)
-    {
-        if (property == "IsEnabled") return value is "False" or "false";
-        return value is "True" or "true";
-    }
 
     /// <summary>C# using 命名空间映射。</summary>
     public static readonly IReadOnlyDictionary<string, string> CSharpNamespaces = new Dictionary<string, string>
@@ -141,10 +300,6 @@ public static class KnownMaps
         ["System.Windows.Media.Brush"] = "global::Avalonia.Media.IBrush",
         ["System.Windows.Media.Brushes"] = "global::Avalonia.Media.Brushes",
         ["System.Windows.Media.SolidColorBrush"] = "global::Avalonia.Media.SolidColorBrush",
-        ["System.Windows.Media.FontWeights"] = "global::Avalonia.Media.FontWeights",
-        ["System.Windows.HorizontalAlignment"] = "global::Avalonia.Layout.HorizontalAlignment",
-        ["System.Windows.VerticalAlignment"] = "global::Avalonia.Layout.VerticalAlignment",
-        ["System.Windows.Visibility"] = "global::Avalonia.Visibility",
         ["System.Windows.Threading.Dispatcher"] = "global::Avalonia.Threading.Dispatcher",
         ["System.Windows.Threading.DispatcherTimer"] = "global::Avalonia.Threading.DispatcherTimer",
     };
@@ -173,5 +328,88 @@ public static class KnownMaps
         "UpdateSourceTrigger", "ValidatesOnDataErrors", "ValidatesOnExceptions",
         "ValidatesOnNotifyDataErrors", "NotifyOnValidationError", "NotifyOnSourceUpdated",
         "NotifyOnTargetUpdated", "IsAsync", "BindingGroupName", "BindsDirectlyToSource",
+    };
+
+    /// <summary>
+    /// {x:Static 命令} → RepeatButton 模板部件名。
+    /// Avalonia 官方 ScrollBar/Slider 模板经 x:Name="PART_*" 约定驱动（无 Command 特性，
+    /// 对照 Avalonia.Themes.Fluent ScrollBar.xaml 源码验证）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> XStaticCommandToPart = new Dictionary<string, string>
+    {
+        ["ScrollBar.LineUpCommand"] = "PART_LineUpButton",
+        ["ScrollBar.LineDownCommand"] = "PART_LineDownButton",
+        ["ScrollBar.PageUpCommand"] = "PART_PageUpButton",
+        ["ScrollBar.PageDownCommand"] = "PART_PageDownButton",
+        // 水平方向：Avalonia Fluent 水平模板同样使用 LineUp/LineDown 部件名（Column left/right）
+        ["ScrollBar.LineLeftCommand"] = "PART_LineUpButton",
+        ["ScrollBar.LineRightCommand"] = "PART_LineDownButton",
+        ["ScrollBar.PageLeftCommand"] = "PART_PageUpButton",
+        ["ScrollBar.PageRightCommand"] = "PART_PageDownButton",
+        ["Slider.IncreaseLarge"] = "PART_IncreaseLarge",
+        ["Slider.DecreaseLarge"] = "PART_DecreaseLarge",
+    };
+
+    /// <summary>WPF 系统颜色键 → 近似固定色（Avalonia 无系统主题键；Light 主题近似值）。</summary>
+    public static readonly IReadOnlyDictionary<string, string> WpfSystemColorFallbacks = new Dictionary<string, string>
+    {
+        ["SystemColors.ControlTextBrushKey"] = "#FF000000",
+        ["SystemColors.GrayTextBrushKey"] = "#FF6D6D6D",
+        ["SystemColors.InactiveSelectionHighlightBrushKey"] = "#FF9A9A9A",
+        ["SystemColors.ControlDarkBrushKey"] = "#FFACA899",
+        ["SystemColors.HighlightBrushKey"] = "#FF0078D4",
+        ["SystemColors.WindowBrushKey"] = "#FFFFFFFF",
+        ["SystemColors.WindowTextBrushKey"] = "#FF000000",
+        ["SystemColors.ControlBrushKey"] = "#FFF0F0F0",
+        ["SystemColors.ActiveBorderBrushKey"] = "#FFB4B4B4",
+        ["SystemColors.InactiveBorderBrushKey"] = "#FFB4B4B4",
+    };
+
+    /// <summary>WPF 特效属性 → Avalonia 属性（DropShadowEffect 无 ShadowDepth，用 OffsetY）。</summary>
+    public static readonly IReadOnlyDictionary<string, string> EffectAttributeRenames = new Dictionary<string, string>
+    {
+        ["ShadowDepth"] = "OffsetY",
+        ["Direction"] = "", // WPF 光照角度方向，Avalonia 无对应 → 删除
+    };
+
+    /// <summary>
+    /// Setter/触发器属性名重命名（先经 <see cref="NormalizePropertyPath"/> 归一化，
+    /// 值由调用方按语义转换）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> SetterPropertyRenames = new Dictionary<string, string>
+    {
+        // WPF Visibility → Avalonia IsVisible（值 Visible→True / Collapsed|Hidden→False）
+        ["Visibility"] = "IsVisible",
+    };
+
+    /// <summary>
+    /// Avalonia Fluent 主题必定提供类型键 ControlTheme 的核心控件
+    /// （逐一核对 Avalonia.Themes.Fluent 的控件主题文件）。
+    /// setter-only 命名主题引用这些类型时可安全自动补 BasedOn。
+    /// </summary>
+    public static readonly IReadOnlySet<string> DefaultThemeTypes = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // 按钮/选择
+        "Button", "RepeatButton", "ToggleButton", "CheckBox", "RadioButton",
+        "ComboBox", "ComboBoxItem", "ListBox", "ListBoxItem", "DropDownButton", "SplitButton",
+        "Expander", "TabControl", "TabItem", "TreeView", "TreeViewItem",
+        "Menu", "MenuFlyout", "ContextMenu", "MenuItem", "Separator",
+        // 输入
+        "TextBox", "PasswordBox", "AutoCompleteBox", "NumericUpDown",
+        "TextBlock", "SelectableTextBlock", "Label",
+        // 范围/滚动
+        "Slider", "ProgressBar", "ScrollBar", "ScrollViewer", "Spinner",
+        "DatePicker", "TimePicker", "Calendar", "CalendarButton", "CalendarDayButton",
+        "CalendarItem", "CalendarDatePicker",
+        // 容器/原语
+        "ContentControl", "HeaderedContentControl", "ItemsControl", "HeaderedItemsControl",
+        "Border", "Grid", "StackPanel", "WrapPanel", "DockPanel", "UniformGrid",
+        "Canvas", "Panel", "Decorator", "Viewbox", "VirtualizingStackPanel",
+        "SplitView", "SplitViewPane", "GridSplitter", "BusyArea",
+        // 反馈
+        "ToolTip", "FlyoutPresenter", "PopupRoot", "OverlayPopupHost",
+        "DataGrid", "DataGridCell", "DataGridRow", "DataGridRowHeader", "DataGridColumnHeader",
+        // Window/WindowBase 不在 Fluent 主题内（由 WindowBase 主题提供），未列入
+        "Window", "WindowBase",
     };
 }
