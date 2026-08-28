@@ -101,6 +101,9 @@ internal static class Program
             Console.WriteLine($"  TODO [{todo.Key}] x{todo.Count()}");
         }
 
+        foreach (var err in report.Notes.Where(n => n.Rule is "PROJECT-ERROR" or "NO-PROJECT"))
+            Console.WriteLine($"  ⚠ {err.File}: {err.Message}");
+
         return 0;
     }
 

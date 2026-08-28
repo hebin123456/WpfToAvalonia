@@ -211,7 +211,13 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             WpfDetected = true;
             Note(node, NoteSeverity.Info, "CS-FREEZE-REMOVED",
                 $"{node.Expression} 语句已删除（Avalonia 无冻结/初始化协议，资源对象不可变）。");
-            return null; // 从语句列表中移除
+
+            // 语句列表成员（Block/SwitchSection/顶层）可整句移除；
+            // 控制流单语句体（if(x) obj.Freeze();）不可为 null —— Roslyn VisitIfStatement
+            // 会 ArgumentNullException(statement)，退化为空块 { }
+            if (node.Parent is BlockSyntax or SwitchSectionSyntax or GlobalStatementSyntax)
+                return null;
+            return SyntaxFactory.Block().WithTriviaFrom(node);
         }
         return base.VisitExpressionStatement(node);
     }

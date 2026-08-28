@@ -172,6 +172,7 @@ public static class KnownMaps
         var val = value?.Trim().Trim('"') ?? "";
         var isTrue = string.Equals(val, "True", StringComparison.OrdinalIgnoreCase);
         var isFalse = string.Equals(val, "False", StringComparison.OrdinalIgnoreCase);
+        var noValue = val.Length == 0; // 反编译丢值：WPF 默认 null
 
         switch (prop)
         {
@@ -180,14 +181,60 @@ public static class KnownMaps
             case "IsEnabled" when isFalse: pseudoClass = "disabled"; return true;
             case "IsChecked" when isTrue: pseudoClass = "checked"; return true;
             case "IsChecked" when isFalse: pseudoClass = "unchecked"; return true;
+            // 无 Value：WPF 默认 null → ToggleButton.IsChecked 三态 indeterminate（伪类已验证）
+            case "IsChecked" when noValue: pseudoClass = "indeterminate"; return true;
             case "IsSelected" when isTrue: pseudoClass = "selected"; return true;
             case "IsFocused" when isTrue:
             case "IsKeyboardFocused" when isTrue: pseudoClass = "focus"; return true;
             case "IsExpanded" when isTrue: pseudoClass = "expanded"; return true;
-            case "IsDropDownOpen" when isTrue:
+            // ComboBox :dropdownopen（MenuItem IsSubmenuOpen → :open，已按控件伪类表核实）
+            case "IsDropDownOpen" when isTrue: pseudoClass = "dropdownopen"; return true;
             case "IsSubmenuOpen" when isTrue: pseudoClass = "open"; return true;
+            // ItemsControl :empty / TextBox :empty（伪类表已验证）
+            case "HasItems" when isFalse: pseudoClass = "empty"; return true;
+            case "Text" when val.Length == 0 || val == "\"\"": pseudoClass = "empty"; return true;
+            // Thumb :pressed（IsDragging 语义=拖拽按住）
+            case "IsDragging" when isTrue: pseudoClass = "pressed"; return true;
+            // ScrollBar :horizontal / :vertical
+            case "Orientation" when string.Equals(val, "Horizontal", StringComparison.OrdinalIgnoreCase):
+                pseudoClass = "horizontal"; return true;
+            case "Orientation" when string.Equals(val, "Vertical", StringComparison.OrdinalIgnoreCase):
+                pseudoClass = "vertical"; return true;
             default: return false;
         }
+    }
+
+    /// <summary>无 Value 触发器（WPF 默认 null）→ "非 null 即命中"语义的属性，Avalonia 伪类等价。</summary>
+    public static bool TryGetNonNullPseudoClass(string property, out string pseudoClass)
+    {
+        pseudoClass = "";
+        var prop = NormalizePropertyPath(property);
+        switch (prop)
+        {
+            case "Icon" when prop == "Icon": pseudoClass = "icon"; return true; // MenuItem :icon
+            default: return false;
+        }
+    }
+
+    /// <summary>
+    /// 触发器条件 → Avalonia 选择器段：伪类 ":xxx" 或属性匹配器 "[Prop=Value]"。
+    /// 属性匹配器仅接受无命名空间前缀属性 + 可解析字面值（布尔解析失败会 AVLN1000）。
+    /// </summary>
+    public static bool TryGetMatcherSegment(string property, string? value, out string segment)
+    {
+        segment = "";
+        var prop = NormalizePropertyPath(property);
+        var val = value?.Trim() ?? "";
+
+        // 属性名带命名空间前缀（附加属性/自定义控件属性）：匹配器语法不支持 → 人工
+        if (prop.Contains(':') || prop.Contains('(')) return false;
+        // 空值/标记扩展/绑定值：无法字面解析（"" 对 Boolean 报 AVLN1000）→ 伪类或人工
+        if (val.Length == 0 || val.StartsWith('{') || val.Contains(' ') || val.Contains(',')) return false;
+        // 布尔属性以外的枚举/字符串值仅限安全字符（避免解析歧义）
+        if (!val.All(c => char.IsLetterOrDigit(c) || c is '_' or '-' or '.' or '#')) return false;
+
+        segment = $"[{prop}={val}]";
+        return true;
     }
 
     /// <summary>WPF Visibility 三态 → Avalonia IsVisible(bool)。Hidden 无布局占位等价物。</summary>
@@ -411,5 +458,30 @@ public static class KnownMaps
         "DataGrid", "DataGridCell", "DataGridRow", "DataGridRowHeader", "DataGridColumnHeader",
         // Window/WindowBase 不在 Fluent 主题内（由 WindowBase 主题提供），未列入
         "Window", "WindowBase",
+    };
+
+    /// <summary>
+    /// 反编译 DataTrigger/Condition 的 Binding Path 中可安全视作「控件属性」的名字
+    /// （WPF UIElement/Control/常见控件状态属性全集，用于伪类/匹配器判定；
+    /// 未列入的名字按 DataContext 属性处理 → 人工）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> ControlPropertyNames = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // UIElement 状态
+        "IsMouseOver", "IsMouseDirectlyOver", "IsMouseCaptured", "IsStylusOver", "IsHitTestVisible",
+        "IsEnabled", "IsFocused", "IsKeyboardFocused", "IsKeyboardFocusWithin", "IsKeyboardLocked",
+        "IsVisible", "IsManipulationEnabled", "Focusable", "IsLoaded", "IsInitialized",
+        // ButtonBase/ToggleButton/Button
+        "IsPressed", "IsChecked", "IsIndeterminate", "IsDefault", "IsDefaulted", "IsCancel",
+        "IsHighlighted", "ClickMode",
+        // 选择/展开/弹出
+        "IsSelected", "IsSelectionActive", "IsExpanded", "IsDropDownOpen", "IsSubmenuOpen",
+        "IsEditable", "IsReadOnly", "StaysOpen", "IsActive", "IsOpen", "IsDragging",
+        "IsEditableItem", "IsActiveItem", "IsSingleSelectionFollowsFocus",
+        // 内容/项
+        "HasItems", "HasContent", "HasHeader", "HasError", "Text", "Icon", "Hint", "Header",
+        "WordWrap", "Orientation", "FlowDirection", "SortDirection", "Grouping",
+        // ScrollBar/Slider/RangeBase
+        "Value", "Minimum", "Maximum", "LargeChange", "SmallChange",
     };
 }

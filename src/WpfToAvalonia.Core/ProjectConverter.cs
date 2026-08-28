@@ -119,12 +119,22 @@ public sealed class ProjectConverter
         foreach (var cs in csFiles.Where(p => p != appCs))
         {
             var rel = Path.GetRelativePath(dir, cs);
-            var source = File.ReadAllText(cs);
-            var result = csharp.Transform(source, rel);
+            CSharpTransformResult result;
+            try
+            {
+                result = csharp.Transform(File.ReadAllText(cs), rel);
+            }
+            catch (Exception ex)
+            {
+                _report.Add(new ConversionNote(rel, 0, NoteSeverity.Manual, "CS-PARSE-ERROR",
+                    $"C# AST 转换失败：{ex.Message}，该文件保留原样，请人工处理。"));
+                continue;
+            }
             if (!result.WpfDetected) continue;
 
             _report.AddRange(result.Notes);
-            if (!_options.DryRun && result.Code != source)
+            var csSource = File.ReadAllText(cs);
+            if (!_options.DryRun && result.Code != csSource)
             {
                 File.WriteAllText(cs, result.Code);
             }
@@ -364,6 +374,7 @@ public static class ConversionRunner
             {
                 report.Add(new ConversionNote(Path.GetFileName(p), 0, NoteSeverity.Manual, "PROJECT-ERROR",
                     $"工程转换失败：{ex.Message}"));
+                Console.Error.WriteLine(ex);
             }
         }
 

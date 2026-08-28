@@ -696,8 +696,20 @@ public sealed partial class XamlTransformer
         var targetTypeRaw = style.Attribute("TargetType")?.Value?.Trim();
         if (targetTypeRaw == null)
         {
-            Note(style, NoteSeverity.Manual, "XAML-STYLE-NO-TARGETTYPE",
-                "无 TargetType 的 Style 无法转为 ControlTheme，需人工补写 TargetType。");
+            // 反编译主题的 FocusVisual/OptionMarkFocusVisual 等：仅含模板、无 TargetType。
+            // WPF 中仅经 FocusVisualStyle 引用；Avalonia 无 FocusVisualStyle 机制（引用点已随属性删除），
+            // 该样式成死代码且 Control 无 Template 属性无法转 ControlTheme → 注释移除。
+            var focusKey = style.Attribute(XNs.GetName("Key"))?.Value;
+            if (focusKey != null && focusKey.Contains("FocusVisual", StringComparison.Ordinal))
+            {
+                ReplaceWithComment(style, "XAML-FOCUSVISUAL-STYLE",
+                    $"焦点视觉样式 {focusKey} 已移除（Avalonia 无 FocusVisualStyle 机制，焦点视觉由主题内部处理；所有引用点已随 FocusVisualStyle 属性删除）。");
+            }
+            else
+            {
+                Note(style, NoteSeverity.Manual, "XAML-STYLE-NO-TARGETTYPE",
+                    "无 TargetType 的 Style 无法转为 ControlTheme，需人工补写 TargetType。");
+            }
             return;
         }
 
@@ -818,23 +830,23 @@ public sealed partial class XamlTransformer
                     var val = trigger.Attribute("Value")?.Value;
                     var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
 
-                    if (KnownMaps.TryGetTriggerPseudoClass(prop, val, out var pseudo) && setters.Count > 0)
+                    if (TryConditionSegments(prop, val, out var seg) && setters.Count > 0)
                     {
                         // 嵌套样式必须直接放在 ControlTheme 下（而非 Style.Triggers 容器内）
                         var nested = new XElement(XName.Get("Style", ns),
-                            new XAttribute("Selector", $"^:{pseudo}"));
+                            new XAttribute("Selector", "^" + seg));
                         foreach (var s in setters)
                             nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
                         nested.Add(new XText("\n    "));
                         controlTheme.Add(new XText("\n    "), nested);
                         trigger.Remove();
                         Note(controlTheme, NoteSeverity.Info, "XAML-TRIGGER-CONVERT",
-                            $"Trigger({KnownMaps.NormalizePropertyPath(prop)}={val}) → 嵌套 Style Selector=\"^:{pseudo}\"。");
+                            $"Trigger({KnownMaps.NormalizePropertyPath(prop)}={val}) → 嵌套 Style Selector=\"^{seg}\"。");
                     }
                     else
                     {
                         ReplaceWithComment(trigger, "XAML-TRIGGER-UNSUPPORTED",
-                            $"Trigger({prop}={val}) 无伪类等价物（如 IsDefault/IsDefaulted 或 False 值条件），需人工改写。");
+                            $"Trigger({prop}={val}) 无伪类/属性匹配器等价物（如 IsDefault/IsHighlighted 或空值条件），需人工改写。");
                     }
                     break;
                 }
@@ -844,19 +856,19 @@ public sealed partial class XamlTransformer
                         .Element(XName.Get("MultiTrigger.Conditions", ns))?
                         .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
                     var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
-                    var pseudos = new List<string>();
+                    var segments = new List<string>();
                     var ok = conditions.Count > 0 && setters.Count > 0;
                     foreach (var c in conditions)
                     {
-                        if (KnownMaps.TryGetTriggerPseudoClass(c.Attribute("Property")?.Value ?? "",
-                                c.Attribute("Value")?.Value, out var p))
-                            pseudos.Add(p);
+                        if (TryConditionSegments(c.Attribute("Property")?.Value ?? "",
+                                c.Attribute("Value")?.Value, out var seg))
+                            segments.Add(seg);
                         else { ok = false; break; }
                     }
 
                     if (ok)
                     {
-                        var selector = "^" + string.Concat(pseudos.Select(p => ":" + p));
+                        var selector = "^" + string.Concat(segments);
                         var nested = new XElement(XName.Get("Style", ns), new XAttribute("Selector", selector));
                         foreach (var s in setters)
                             nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
@@ -864,25 +876,79 @@ public sealed partial class XamlTransformer
                         controlTheme.Add(new XText("\n    "), nested);
                         trigger.Remove();
                         Note(controlTheme, NoteSeverity.Info, "XAML-MULTITRIGGER-CONVERT",
-                            $"MultiTrigger({string.Join(" & ", conditions.Select(c => $"{c.Attribute("Property")?.Value}={c.Attribute("Value")?.Value}"))}) → 嵌套 Style Selector=\"{selector}\"（伪类链=AND）。");
+                            $"MultiTrigger({string.Join(" & ", conditions.Select(c => $"{c.Attribute("Property")?.Value}={c.Attribute("Value")?.Value}"))}) → 嵌套 Style Selector=\"{selector}\"（段链=AND）。");
                     }
                     else
                     {
                         ReplaceWithComment(trigger, "XAML-MULTITRIGGER",
-                            "MultiTrigger 含无伪类等价物的条件，需人工改写（伪类链或属性匹配器）。");
+                            "MultiTrigger 含无等价物的条件，需人工改写（伪类/属性匹配器链）。");
                     }
                     break;
                 }
                 case "DataTrigger":
                 {
-                    ReplaceWithComment(trigger, "XAML-DATATRIGGER",
-                        "Style 内 DataTrigger（数据条件）无选择器等价物：建议 VM 计算布尔属性 + Classes，或属性匹配器 [Prop=值]。");
+                    // 反编译形态：Binding Path=控件属性（UIElement.IsMouseOver 等被反编译为数据绑定）
+                    // → 视作属性触发器（伪类/匹配器）；真 VM 属性绑定保留人工
+                    var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+                    var path = ExtractDataTriggerPath(trigger);
+                    var val = trigger.Attribute("Value")?.Value ?? "True"; // 无 Value 的反编译 hover 形态按 true
+                    if (path != null && KnownMaps.ControlPropertyNames.Contains(KnownMaps.NormalizePropertyPath(path)) &&
+                        setters.Count > 0 && TryConditionSegments(path, val, out var seg))
+                    {
+                        var nested = new XElement(XName.Get("Style", ns),
+                            new XAttribute("Selector", "^" + seg));
+                        foreach (var s in setters)
+                            nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
+                        nested.Add(new XText("\n    "));
+                        controlTheme.Add(new XText("\n    "), nested);
+                        trigger.Remove();
+                        Note(controlTheme, NoteSeverity.Info, "XAML-DATATRIGGER-CONVERT",
+                            $"DataTrigger(Binding Path={path}, Value={val}) 为控件属性条件 → 嵌套 Style Selector=\"^{seg}\"。");
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-DATATRIGGER",
+                            "Style 内 DataTrigger（DataContext 属性条件）无选择器等价物：建议 VM 计算布尔属性 + Classes，或属性匹配器 [Prop=值]。");
+                    }
                     break;
                 }
                 case "MultiDataTrigger":
                 {
-                    ReplaceWithComment(trigger, "XAML-MULTIDATATRIGGER",
-                        "MultiDataTrigger 需人工改写：VM 计算布尔属性 + Classes 类选择器。");
+                    // 全部条件均为控件属性 → 伪类/匹配器链；否则人工
+                    var conditions = trigger
+                        .Element(XName.Get("MultiDataTrigger.Conditions", ns))?
+                        .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
+                    var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
+                    var segments = new List<string>();
+                    var ok = conditions.Count > 0 && setters.Count > 0;
+                    foreach (var c in conditions)
+                    {
+                        var path = ExtractConditionPath(c, ns);
+                        var val = c.Attribute("Value")?.Value ?? "True";
+                        if (path != null &&
+                            KnownMaps.ControlPropertyNames.Contains(KnownMaps.NormalizePropertyPath(path)) &&
+                            TryConditionSegments(path, val, out var seg))
+                            segments.Add(seg);
+                        else { ok = false; break; }
+                    }
+
+                    if (ok)
+                    {
+                        var selector = "^" + string.Concat(segments);
+                        var nested = new XElement(XName.Get("Style", ns), new XAttribute("Selector", selector));
+                        foreach (var s in setters)
+                            nested.Add(new XText("\n        "), CloneSetterWithoutTargetName(s));
+                        nested.Add(new XText("\n    "));
+                        controlTheme.Add(new XText("\n    "), nested);
+                        trigger.Remove();
+                        Note(controlTheme, NoteSeverity.Info, "XAML-MULTIDATATRIGGER-CONVERT",
+                            $"MultiDataTrigger（控件属性条件）→ 嵌套 Style Selector=\"{selector}\"。");
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-MULTIDATATRIGGER",
+                            "MultiDataTrigger 需人工改写：VM 计算布尔属性 + Classes 类选择器。");
+                    }
                     break;
                 }
                 case "EventTrigger":
@@ -925,10 +991,61 @@ public sealed partial class XamlTransformer
                     ConvertTemplateMultiTrigger(controlTheme, trigger, partMap);
                     break;
                 case "DataTrigger":
-                case "MultiDataTrigger":
-                    ReplaceWithComment(trigger, "XAML-DATATRIGGER-TEMPLATE",
-                        "ControlTemplate 内 DataTrigger 需人工改写（模板部件的条件外观建议 Tag/Classes + 属性匹配器）。");
+                {
+                    // 反编译形态：Binding Path=控件属性 → 与 Trigger 同路径转换；VM 属性 → 人工
+                    var path = ExtractDataTriggerPath(trigger);
+                    var val = trigger.Attribute("Value")?.Value;
+                    if (path != null &&
+                        KnownMaps.ControlPropertyNames.Contains(KnownMaps.NormalizePropertyPath(path)))
+                    {
+                        var sourceName = trigger.Attribute("SourceName")?.Value;
+                        ConvertTemplateTriggerCore(controlTheme, trigger, partMap, path, val, sourceName,
+                            "XAML-DATATRIGGER-TEMPLATE-CONVERT", "XAML-DATATRIGGER-TEMPLATE");
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-DATATRIGGER-TEMPLATE",
+                            "ControlTemplate 内 DataTrigger（DataContext/VM 属性条件）需人工改写（模板部件条件外观建议 Tag/Classes + 属性匹配器）。");
+                    }
                     break;
+                }
+                case "MultiDataTrigger":
+                {
+                    // 全部条件为控件属性 → 匹配器/伪类链；否则人工
+                    var mdConditions = trigger
+                        .Element(XName.Get("MultiDataTrigger.Conditions", ns))?
+                        .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
+                    var ok = mdConditions.Count > 0 && mdConditions.All(c =>
+                    {
+                        var p = ExtractConditionPath(c, ns);
+                        return p != null && KnownMaps.ControlPropertyNames.Contains(KnownMaps.NormalizePropertyPath(p));
+                    });
+
+                    if (ok)
+                    {
+                        // 逐条件转换：全部段可拼 → 交给单触发器管线（段链）
+                        var first = mdConditions[0];
+                        var firstPath = ExtractConditionPath(first, ns)!;
+                        var firstVal = first.Attribute("Value")?.Value;
+                        if (mdConditions.Count == 1)
+                        {
+                            ConvertTemplateTriggerCore(controlTheme, trigger, partMap, firstPath, firstVal,
+                                trigger.Attribute("SourceName")?.Value,
+                                "XAML-MULTIDATATRIGGER-TEMPLATE-CONVERT", "XAML-DATATRIGGER-TEMPLATE");
+                        }
+                        else
+                        {
+                            ReplaceWithComment(trigger, "XAML-DATATRIGGER-TEMPLATE",
+                                "多条件 MultiDataTrigger（控件属性）需人工改写为段链选择器（^:a[Prop=v] /template/ …）。");
+                        }
+                    }
+                    else
+                    {
+                        ReplaceWithComment(trigger, "XAML-DATATRIGGER-TEMPLATE",
+                            "ControlTemplate 内 MultiDataTrigger（VM 属性条件）需人工改写。");
+                    }
+                    break;
+                }
                 case "EventTrigger":
                     ReplaceWithComment(trigger, "XAML-EVENTTRIGGER-TEMPLATE",
                         "ControlTemplate 内 EventTrigger/动画需改写为 Avalonia Animation/Transitions。");
@@ -947,14 +1064,23 @@ public sealed partial class XamlTransformer
 
     private void ConvertTemplateTrigger(XElement controlTheme, XElement trigger, Dictionary<string, XElement> partMap)
     {
+        ConvertTemplateTriggerCore(controlTheme, trigger, partMap,
+            trigger.Attribute("Property")?.Value ?? "",
+            trigger.Attribute("Value")?.Value,
+            trigger.Attribute("SourceName")?.Value,
+            "XAML-TEMPLATE-TRIGGER-CONVERT", "XAML-TEMPLATE-TRIGGER-UNSUPPORTED");
+    }
+
+    /// <summary>模板触发器统一转换：条件段（伪类或匹配器）+ TargetName 分组 → /template/ 嵌套样式。</summary>
+    private void ConvertTemplateTriggerCore(XElement controlTheme, XElement trigger,
+        Dictionary<string, XElement> partMap, string prop, string? val, string? sourceName,
+        string convertRule, string unsupportedRule)
+    {
         var ns = controlTheme.Name.NamespaceName;
-        var prop = trigger.Attribute("Property")?.Value ?? "";
-        var val = trigger.Attribute("Value")?.Value;
-        var sourceName = trigger.Attribute("SourceName")?.Value;
         var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
         var hasActions = trigger.Elements().Any(e => e.Name.LocalName is "EnterActions" or "ExitActions");
 
-        var conditionPseudo = KnownMaps.TryGetTriggerPseudoClass(prop, val, out var pseudo) ? pseudo : null;
+        var condSeg = TryConditionSegments(prop, val, out var seg) ? seg : null;
 
         // 按 TargetName 分组生成嵌套样式
         var groups = setters.GroupBy(s => s.Attribute("TargetName")?.Value).ToList();
@@ -969,22 +1095,22 @@ public sealed partial class XamlTransformer
             if (targetName == null)
             {
                 // Setter 目标 = 控件本身
-                if (conditionPseudo == null) { leftovers.AddRange(group); continue; }
-                selector = $"^:{conditionPseudo}";
+                if (condSeg == null) { leftovers.AddRange(group); continue; }
+                selector = "^" + condSeg;
             }
             else if (sourceName == null)
             {
-                // 条件在控件上，Setter 打模板部件：^:pseudo /template/ Type#Part
-                if (conditionPseudo == null || !partMap.TryGetValue(targetName, out var part))
+                // 条件在控件上，Setter 打模板部件：^{seg} /template/ Type#Part
+                if (condSeg == null || !partMap.TryGetValue(targetName, out var part))
                 { leftovers.AddRange(group); continue; }
-                selector = $"^:{conditionPseudo} /template/ {PartSelector(part)}";
+                selector = $"^{condSeg} /template/ {PartSelector(part)}";
             }
             else if (sourceName == targetName)
             {
-                // 条件与 Setter 同部件：^ /template/ Type#Part:pseudo
-                if (conditionPseudo == null || !partMap.TryGetValue(targetName, out var part))
+                // 条件与 Setter 同部件：^ /template/ Type#Part{seg}（伪类/匹配器均可后缀）
+                if (condSeg == null || !partMap.TryGetValue(targetName, out var part))
                 { leftovers.AddRange(group); continue; }
-                selector = $"^ /template/ {PartSelector(part)}:{conditionPseudo}";
+                selector = $"^ /template/ {PartSelector(part)}{condSeg}";
             }
             else
             {
@@ -999,8 +1125,8 @@ public sealed partial class XamlTransformer
 
         if (converted > 0)
         {
-            Note(controlTheme, NoteSeverity.Info, "XAML-TEMPLATE-TRIGGER-CONVERT",
-                $"ControlTemplate.Triggers: Trigger({KnownMaps.NormalizePropertyPath(prop)}={val})" +
+            Note(controlTheme, NoteSeverity.Info, convertRule,
+                $"ControlTemplate.Triggers: 条件({KnownMaps.NormalizePropertyPath(prop)}={val})" +
                 (sourceName != null ? $" SourceName={sourceName}" : "") +
                 $" → {converted} 个 \"/template/\" 嵌套样式。");
         }
@@ -1009,10 +1135,10 @@ public sealed partial class XamlTransformer
             Note(trigger, NoteSeverity.Manual, "XAML-TEMPLATE-TRIGGER-ACTIONS",
                 "触发器含 EnterActions/ExitActions 动画，需改写为 Avalonia Animation/Transitions。");
 
-        if (leftovers.Count > 0 || conditionPseudo == null)
+        if (leftovers.Count > 0 || condSeg == null)
         {
-            ReplaceWithComment(trigger, "XAML-TEMPLATE-TRIGGER-UNSUPPORTED",
-                $"Trigger({prop}={val}) 的部分条件/Setter 无选择器等价物（伪类不存在、SourceName≠TargetName 或部件未找到），已注释保留待人工处理。");
+            ReplaceWithComment(trigger, unsupportedRule,
+                $"条件({prop}={val}) 的部分条件/Setter 无选择器等价物（无伪类/匹配器、SourceName≠TargetName 或部件未找到），已注释保留待人工处理。");
         }
         else
         {
@@ -1028,16 +1154,16 @@ public sealed partial class XamlTransformer
             .Elements(XName.Get("Condition", ns)).ToList() ?? new List<XElement>();
         var setters = trigger.Elements().Where(e => e.Name.LocalName == "Setter").ToList();
 
-        var pseudos = new List<string>();
+        var segments = new List<string>();
         foreach (var c in conditions)
         {
-            if (KnownMaps.TryGetTriggerPseudoClass(c.Attribute("Property")?.Value ?? "",
-                    c.Attribute("Value")?.Value, out var p))
-                pseudos.Add(p);
+            if (TryConditionSegments(c.Attribute("Property")?.Value ?? "",
+                    c.Attribute("Value")?.Value, out var seg))
+                segments.Add(seg);
             else
             {
                 ReplaceWithComment(trigger, "XAML-MULTITRIGGER-TEMPLATE",
-                    "ControlTemplate 内 MultiTrigger 含无伪类等价物的条件，需人工改写。");
+                    "ControlTemplate 内 MultiTrigger 含无等价物（伪类/匹配器）的条件，需人工改写。");
                 return;
             }
         }
@@ -1049,7 +1175,7 @@ public sealed partial class XamlTransformer
             return;
         }
 
-        var chained = string.Concat(pseudos.Select(p => ":" + p));
+        var chained = string.Concat(segments);
         var groups = setters.GroupBy(s => s.Attribute("TargetName")?.Value).ToList();
         var converted = 0;
         foreach (var group in groups)
@@ -1222,6 +1348,54 @@ public sealed partial class XamlTransformer
         // 复杂绑定（转换器/ElementName 等）不支持机械转换
         if (binding.Attributes().Any(a => a.Name.LocalName is not ("Path" or "Mode"))) return null;
         return path;
+    }
+
+    /// <summary>MultiDataTrigger 的 Condition：Binding（属性元素或内联）取简单 Path。</summary>
+    private static string? ExtractConditionPath(XElement condition, string ns)
+    {
+        var bindingAttr = condition.Attribute("Binding")?.Value;
+        if (bindingAttr != null)
+        {
+            var m = Regex.Match(bindingAttr, @"\{Binding\s+(?:Path\s*=\s*)?(?<path>[A-Za-z_][A-Za-z0-9_.]*)\s*\}");
+            return m.Success ? m.Groups["path"].Value : null;
+        }
+
+        var bindingEl = condition.Element(XName.Get("Condition.Binding", ns));
+        var binding = bindingEl?.Elements().FirstOrDefault(e => e.Name.LocalName == "Binding");
+        if (binding == null) return null;
+        if (binding.Attributes().Any(a => a.Name.LocalName is not ("Path" or "Mode"))) return null;
+        return binding.Attribute("Path")?.Value;
+    }
+
+    /// <summary>
+    /// 触发器条件 → Avalonia 选择器段：优先伪类 ":xxx"（含无 Value 的 null 语义），
+    /// 其次属性匹配器 "[Prop=Val]"（字面可解析）。均不可 → false（人工）。
+    /// </summary>
+    private static bool TryConditionSegments(string property, string? value, out string segments)
+    {
+        segments = "";
+
+        if (KnownMaps.TryGetTriggerPseudoClass(property, value, out var pseudo))
+        {
+            segments = ":" + pseudo;
+            return true;
+        }
+
+        // 无 Value（WPF 默认 null）→ 非 null 命中语义的伪类（如 MenuItem.Icon → :icon）
+        var rawVal = value?.Trim() ?? "";
+        if (rawVal.Length == 0 && KnownMaps.TryGetNonNullPseudoClass(property, out var nonNullPseudo))
+        {
+            segments = ":" + nonNullPseudo;
+            return true;
+        }
+
+        if (KnownMaps.TryGetMatcherSegment(property, value, out var matcher))
+        {
+            segments = matcher;
+            return true;
+        }
+
+        return false;
     }
 
     private static XElement? FindNamedElement(XElement root, string? name)
