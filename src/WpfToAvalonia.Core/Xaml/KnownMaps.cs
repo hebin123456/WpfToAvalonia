@@ -23,7 +23,7 @@ public static class KnownMaps
         ["http://schemas.microsoft.com/netfx/2009/xaml/presentation"] = AvaloniaNs,
     };
 
-    /// <summary>元素重命名（WPF 独有 → Avalonia 对应物）。</summary>
+    /// <summary>元素重命名（WPF 独有 → Avalonia 对应物）。均经 Avalonia 12 反射验证。</summary>
     public static readonly IReadOnlyDictionary<string, string> ElementRenames = new Dictionary<string, string>
     {
         ["Label"] = "TextBlock",
@@ -31,16 +31,33 @@ public static class KnownMaps
         // Geometry 体系：WPF Geometry 基类/PathGeometry 字符串资源 → StreamGeometry
         ["Geometry"] = "StreamGeometry",
         ["PathGeometry"] = "StreamGeometry",
+        // WPF ListView/ListViewItem → Avalonia ListBox 体系（核心无 ListView；GridView 列视图另行移除）
+        ["ListView"] = "ListBox",
+        ["ListViewItem"] = "ListBoxItem",
+        // WPF Hyperlink 内联元素 → HyperlinkButton（NavigateUri 同名属性保留；RequestNavigate 事件移除）
+        ["Hyperlink"] = "HyperlinkButton",
+        // WPF RichTextBox → TextBox 纯文本降级（Document/Selection API 需人工改写）
+        ["RichTextBox"] = "TextBox",
+        // WPF ListView 模板行呈现器 → ContentPresenter（Avalonia.Controls.Presenters.ContentPresenter）
+        ["GridViewRowPresenter"] = "ContentPresenter",
+    };
+
+    /// <summary>
+    /// WPF GridView 列视图体系元素——Avalonia 核心无对应（DataGrid 是另一套机制）。
+    /// 转换时整体注释移除 + Manual 提示；TargetType 指向这些类型的主题同样移除。
+    /// GridViewRowPresenter 例外：重命名为 ContentPresenter（模板行内容呈现仍有用）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> GridViewFamilyElements = new HashSet<string>
+    {
+        "GridView", "GridViewColumn", "GridViewColumnHeader", "GridViewHeaderRowPresenter",
     };
 
     /// <summary>无核心等价物、需人工处理的元素（保留原样 + Manual 提示）。</summary>
     public static readonly IReadOnlySet<string> UnsupportedElements = new HashSet<string>
     {
-        "RichTextBox", "FlowDocument", "FlowDocumentScrollViewer", "FlowDocumentReader",
+        "FlowDocument", "FlowDocumentScrollViewer", "FlowDocumentReader",
         "Frame", "ToolBar", "ToolBarTray", "StatusBar", "WindowsFormsHost", "WebBrowser",
-        "InkCanvas", "Viewport3D", "MediaElement", "AdornerDecorator", "Ribbon", "JumpList",
-        // Avalonia 核心无 Hyperlink 内联元素（仅 HyperlinkButton），需人工改造
-        "Hyperlink",
+        "InkCanvas", "Viewport3D", "MediaElement", "Ribbon", "JumpList",
         "GeometryGroup", "CombinedGeometry",
     };
 
@@ -89,6 +106,8 @@ public static class KnownMaps
         // Storyboard 附加定位（Avalonia 动画用 Selector 定位，动画本身已标 Manual）
         "Storyboard.TargetName", "Storyboard.TargetProperty",
         "Grid.IsSharedSizeScope",
+        // WPF RichTextBox 文档交互开关（已随 RichTextBox → TextBox 降级）
+        "IsDocumentEnabled",
     };
 
     /// <summary>删除 + Manual 提示的特性（行为缺失需人工补）。</summary>
@@ -101,6 +120,9 @@ public static class KnownMaps
         ["WindowChrome.GlassFrameThickness"] =
             "Avalonia 无 WindowChrome.GlassFrameThickness；玻璃效果需 TransparencyLevelHint。",
         ["WindowChrome.CornerRadius"] = "Avalonia 无 WindowChrome.CornerRadius。",
+        // WPF Hyperlink.RequestNavigate：HyperlinkButton 无该事件（NavigateUri 属性保留）
+        ["RequestNavigate"] =
+            "Avalonia 无 RequestNavigate 事件；HyperlinkButton 保留 NavigateUri，请在 Click 处理器内用 Process.Start(NavigateUri?.ToString()) 打开链接。",
     };
 
     /// <summary>应整体丢弃的 Setter/触发器属性（Avalonia 无对应机制）。</summary>
@@ -290,6 +312,9 @@ public static class KnownMaps
         ["MouseLeave"] = "PointerExited",
         ["MouseWheel"] = "PointerWheelChanged",
         ["PreviewMouseWheel"] = "PointerWheelChanged",
+        // WPF 双击：Avalonia InputElement.DoubleTapped（EventHandler<TappedEventArgs>，已反射验证）
+        ["MouseDoubleClick"] = "DoubleTapped",
+        ["PreviewMouseDoubleClick"] = "DoubleTapped",
     };
 
     /// <summary>右键事件需要运行时通过 PointerEventArgs 判断按键。</summary>
@@ -357,6 +382,10 @@ public static class KnownMaps
         ["ScrollBarVisibility"] = "global::Avalonia.Controls.Primitives.ScrollBarVisibility",
         // WPF ListView → Avalonia ListBox 体系
         ["ListViewItem"] = "global::Avalonia.Controls.ListBoxItem",
+        // ListView 本体（代码侧 new ListView()/类型声明）
+        ["ListView"] = "global::Avalonia.Controls.ListBox",
+        // WPF Hyperlink（代码侧创建链接元素）→ HyperlinkButton
+        ["Hyperlink"] = "global::Avalonia.Controls.HyperlinkButton",
         // 窗口状态枚举位置（成员访问名不受影响）
         ["WindowState"] = "global::Avalonia.Controls.WindowState",
         // Avalonia 12 已移除 Visibility 枚举 → bool（IsVisible）；Hidden/Collapsed 语义合并
@@ -398,7 +427,18 @@ public static class KnownMaps
         ["MouseEnter"] = "PointerEntered",
         ["MouseLeave"] = "PointerExited",
         ["MouseWheel"] = "PointerWheelChanged",
+        // 双击事件（XAML 侧同步重命名；处理器参数类型见 DoubleTappedArgMethods）
+        ["MouseDoubleClick"] = "DoubleTapped",
+        ["PreviewMouseDoubleClick"] = "DoubleTapped",
     };
+
+    /// <summary>
+    /// 双击处理器方法名的包含式判据（MouseDoubleClick → DoubleTapped 时）：
+    /// 处理器参数 MouseButtonEventArgs 应改写为 TappedEventArgs
+    /// （Avalonia InputElement.DoubleTapped：EventHandler&lt;TappedEventArgs&gt;，已反射验证），
+    /// 而非默认映射的 PointerPressedEventArgs。
+    /// </summary>
+    public static readonly string[] DoubleTappedArgMethodHints = { "DoubleClick", "Doubleclick", "doubleClick" };
 
     /// <summary>绑定表达式中应移除的 WPF 特有选项（Avalonia 不支持或语义不同）。</summary>
     public static readonly string[] BindingOptionsToRemove =

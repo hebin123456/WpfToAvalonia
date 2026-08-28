@@ -17,6 +17,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private readonly string _file;
     private readonly List<ConversionNote> _notes = new();
     private readonly HashSet<string> _dedupe = new();
+    private readonly Stack<string> _methodNames = new();
     private int _resourceVarCounter;
 
     public bool WpfDetected { get; private set; }
@@ -251,6 +252,18 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return base.VisitIdentifierName(node);
 
         var name = node.Identifier.ValueText;
+
+        // 双击处理器（MouseDoubleClick → DoubleTapped）的参数类型特判：
+        // Avalonia DoubleTapped 是 EventHandler<TappedEventArgs>，参数须为 TappedEventArgs
+        // 而非默认映射的 PointerPressedEventArgs（方法名含 DoubleClick 判据）
+        if (name == "MouseButtonEventArgs" && IsInDoubleTapHandler())
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-DOUBLETAP-ARGS",
+                "双击处理器参数 MouseButtonEventArgs → TappedEventArgs（DoubleTapped 事件签名，已随 MouseDoubleClick 重命名）。");
+            return SyntaxFactory.ParseName("global::Avalonia.Input.TappedEventArgs").WithTriviaFrom(node);
+        }
+
         if (KnownMaps.TypeRenames.TryGetValue(name, out var mapped))
         {
             WpfDetected = true;
@@ -643,28 +656,42 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
 
     public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
     {
-        if (node.Identifier.ValueText == "OnPropertyChanged" && node.Modifiers.Any(SyntaxKind.OverrideKeyword))
+        _methodNames.Push(node.Identifier.ValueText);
+        try
         {
-            WpfDetected = true;
-            Note(node, NoteSeverity.Manual, "CS-ONPROPERTYCHANGED",
-                "OnPropertyChanged(DependencyPropertyChangedEventArgs) 签名不同；Avalonia 请重写 OnPropertyChanged<T>(AvaloniaPropertyChangedEventArgs<T>)。");
-        }
+            if (node.Identifier.ValueText == "OnPropertyChanged" && node.Modifiers.Any(SyntaxKind.OverrideKeyword))
+            {
+                WpfDetected = true;
+                Note(node, NoteSeverity.Manual, "CS-ONPROPERTYCHANGED",
+                    "OnPropertyChanged(DependencyPropertyChangedEventArgs) 签名不同；Avalonia 请重写 OnPropertyChanged<T>(AvaloniaPropertyChangedEventArgs<T>)。");
+            }
 
-        // OnRender(DrawingContext)：custom drawing 体系差异
-        if (node.Identifier.ValueText == "OnRender" &&
-            node.ParameterList.Parameters.Count == 1 &&
-            node.ParameterList.Parameters[0].Type?.ToString().Contains("DrawingContext") == true)
+            // OnRender(DrawingContext)：custom drawing 体系差异
+            if (node.Identifier.ValueText == "OnRender" &&
+                node.ParameterList.Parameters.Count == 1 &&
+                node.ParameterList.Parameters[0].Type?.ToString().Contains("DrawingContext") == true)
+            {
+                WpfDetected = true;
+                Note(node, NoteSeverity.Manual, "CS-ONRENDER",
+                    "OnRender(DrawingContext) → Avalonia 自绘需继承 CustomDrawingControl / Control + Render(DrawingContext)（context.Context），DrawingContext API（DrawGeometry/DrawRectangle 参数）与 WPF 不同，需逐调用改写。");
+            }
+
+            // WPF OnApplyTemplate 在 Avalonia TemplatedControl 上存在（protected virtual），签名相同 → 保留
+            return base.VisitMethodDeclaration(node);
+        }
+        finally
         {
-            WpfDetected = true;
-            Note(node, NoteSeverity.Manual, "CS-ONRENDER",
-                "OnRender(DrawingContext) → Avalonia 自绘需继承 CustomDrawingControl / Control + Render(DrawingContext)（context.Context），DrawingContext API（DrawGeometry/DrawRectangle 参数）与 WPF 不同，需逐调用改写。");
+            _methodNames.Pop();
         }
-
-        // WPF OnApplyTemplate 在 Avalonia TemplatedControl 上存在（protected virtual），签名相同 → 保留
-        return base.VisitMethodDeclaration(node);
     }
 
     // ------------------------------------------------------------------ 辅助
+
+    /// <summary>当前遍历位置是否处于名称含 DoubleClick 的方法内（双击处理器特判）。</summary>
+    private bool IsInDoubleTapHandler() =>
+        _methodNames.Count > 0 &&
+        KnownMaps.DoubleTappedArgMethodHints.Any(h =>
+            _methodNames.Peek().Contains(h, StringComparison.Ordinal));
 
     private static ExpressionSyntax Expr(SyntaxNode from, string code) =>
         SyntaxFactory.ParseExpression(code).WithTriviaFrom(from);

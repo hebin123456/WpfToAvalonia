@@ -91,6 +91,60 @@ public class CSharpTransformerTests
     }
 
     [Fact]
+    public void MouseDoubleClickEvent_IsRenamed_ToDoubleTapped()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C
+                {
+                    void M(System.Windows.Controls.ListBox list)
+                    {
+                        list.MouseDoubleClick += List_DoubleClick;
+                        list.PreviewMouseDoubleClick -= List_DoubleClick;
+                    }
+                }
+            }
+            """);
+
+        Assert.Contains("list.DoubleTapped += List_DoubleClick", r.Code);
+        Assert.Contains("list.DoubleTapped -= List_DoubleClick", r.Code);
+        Assert.DoesNotContain("MouseDoubleClick", r.Code);
+    }
+
+    [Fact]
+    public void DoubleTapHandler_ParamBecomes_TappedEventArgs()
+    {
+        var r = Transform("""
+            using System.Windows.Input;
+
+            namespace Demo
+            {
+                class C
+                {
+                    void List_DoubleClick(object sender, MouseButtonEventArgs e)
+                    {
+                        var src = e.OriginalSource;
+                    }
+
+                    void OnDown(object sender, MouseButtonEventArgs e)
+                    {
+                        var src = e.OriginalSource;
+                    }
+                }
+            }
+            """);
+
+        // 双击处理器（方法名含 DoubleClick）：参数 → TappedEventArgs
+        Assert.Contains("List_DoubleClick(object sender, global::Avalonia.Input.TappedEventArgs e)", r.Code);
+        // 普通鼠标按下处理器：参数 → PointerPressedEventArgs（默认映射不受影响）
+        Assert.Contains("OnDown(object sender, global::Avalonia.Input.PointerPressedEventArgs e)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-DOUBLETAP-ARGS");
+    }
+
+    [Fact]
     public void MissingAvaloniaUsings_AreInjected()
     {
         var r = Transform("""

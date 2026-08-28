@@ -239,11 +239,231 @@ public class XamlTransformerTests
     {
         var r = Transform("""
             <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
-                <RichTextBox />
+                <Frame Source="Page1.xaml" />
             </Window>
             """);
 
         Assert.Contains(r.Notes, n => n.Rule == "XAML-UNSUPPORTED-ELEMENT" && n.Severity == NoteSeverity.Manual);
+        Assert.Contains("<Frame", r.Xaml); // 保留原样 + 提示（可编译语义由人工替换）
+    }
+
+    [Fact]
+    public void RichTextBox_IsRenamedTo_TextBox_WithManualNote()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <RichTextBox x:Name="OutputTextBox" IsReadOnly="True" IsDocumentEnabled="True" />
+            </Window>
+            """);
+
+        Assert.Contains("<TextBox", r.Xaml);
+        Assert.DoesNotContain("RichTextBox", r.Xaml);
+        Assert.DoesNotContain("IsDocumentEnabled", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-RICHTEXTBOX");
+    }
+
+    [Fact]
+    public void Hyperlink_IsRenamedTo_HyperlinkButton_RequestNavigateDropped()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <Hyperlink NavigateUri="https://example.com" RequestNavigate="H_Click">
+                    <TextBlock Text="example" />
+                </Hyperlink>
+            </Window>
+            """);
+
+        Assert.Contains("<HyperlinkButton", r.Xaml);
+        Assert.Contains("NavigateUri=\"https://example.com\"", r.Xaml);
+        Assert.DoesNotContain("RequestNavigate", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-HYPERLINK");
+    }
+
+    [Fact]
+    public void Hyperlink_PropertyElement_OwnerPrefix_FollowsRename()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <Hyperlink>
+                    <Hyperlink.NavigateUri>https://example.com</Hyperlink.NavigateUri>
+                    <TextBlock Text="example" />
+                </Hyperlink>
+            </Window>
+            """);
+
+        Assert.Contains("HyperlinkButton.NavigateUri", r.Xaml);
+        Assert.DoesNotContain("Hyperlink.NavigateUri", r.Xaml);
+    }
+
+    [Fact]
+    public void ListView_IsRenamedTo_ListBox_AndViewRemoved()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <ListView x:Name="RevList">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Index" DisplayMemberBinding="{Binding Index}" />
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </Window>
+            """);
+
+        Assert.Contains("<ListBox", r.Xaml);
+        // 元素级断言：解析后无 ListView/GridView 节点（注释里的原文不算）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Descendants(), d => d.Name.LocalName == "ListView");
+        Assert.DoesNotContain(doc.Descendants(), d => d.Name.LocalName.Contains("GridView"));
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-LISTVIEW-VIEW");
+    }
+
+    [Fact]
+    public void ListView_ViewAttribute_IsRemoved()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Window.Resources>
+                    <GridView x:Key="Cols" />
+                </Window.Resources>
+                <ListView View="{StaticResource Cols}" />
+            </Window>
+            """);
+
+        Assert.DoesNotContain("View=", r.Xaml);
+        // 资源内 GridView 整体注释移除（解析后无 GridView 元素，仅剩 TODO 注释）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Descendants(), d => d.Name.LocalName == "GridView");
+        Assert.Contains("TODO(wpf2avalonia)", r.Xaml);
+    }
+
+    [Fact]
+    public void ListViewItemStyle_TargetType_Renames_ToListBoxItem()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Window.Resources>
+                    <Style x:Key="ItemStyle" TargetType="ListViewItem">
+                        <Setter Property="Padding" Value="4" />
+                    </Style>
+                </Window.Resources>
+                <ListView ItemContainerStyle="{StaticResource ItemStyle}" />
+            </Window>
+            """);
+
+        Assert.Contains("TargetType=\"ListBoxItem\"", r.Xaml);
+        Assert.Contains("{x:Type ListBoxItem}", r.Xaml); // BasedOn/类型键链同步
+        Assert.Contains("ItemContainerTheme", r.Xaml);
+    }
+
+    [Fact]
+    public void GridViewColumnHeaderTheme_IsRemovedAsComment()
+    {
+        var r = Transform("""
+            <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Style x:Key="HeaderStyle" TargetType="GridViewColumnHeader">
+                    <Setter Property="Background" Value="#FFDDDDDD" />
+                </Style>
+            </ResourceDictionary>
+            """);
+
+        // 主题整体注释移除：解析后无 ControlTheme 元素
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Descendants(), d => d.Name.LocalName == "ControlTheme");
+        Assert.Contains("TODO(wpf2avalonia)", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-GRIDVIEW-THEME");
+    }
+
+    [Fact]
+    public void GridViewRowPresenter_Renames_To_ContentPresenter()
+    {
+        var r = Transform("""
+            <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <Style TargetType="ListViewItem">
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="ListViewItem">
+                                <GridViewRowPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" />
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
+                </Style>
+            </ResourceDictionary>
+            """);
+
+        Assert.Contains("<ContentPresenter", r.Xaml);
+        Assert.DoesNotContain("GridViewRowPresenter", r.Xaml);
+    }
+
+    [Fact]
+    public void MouseDoubleClick_Renames_To_DoubleTapped()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <ListBox MouseDoubleClick="List_DoubleClick" SelectionChanged="List_Selection" />
+            </Window>
+            """);
+
+        Assert.Contains("DoubleTapped=\"List_DoubleClick\"", r.Xaml);
+        Assert.DoesNotContain("MouseDoubleClick", r.Xaml);
+    }
+
+    [Fact]
+    public void Nested_XmlnsDeclarations_AreHoistedOrRemoved()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+              <Border x:Name="B1" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Border x:Name="B2" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" />
+              </Border>
+            </Window>
+            """);
+
+        // 嵌套 xmlns:x 上提到根（根原先未声明 x），根声明唯一
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        var root = doc.Root!;
+        var rootX = root.Attributes().Count(a => a.IsNamespaceDeclaration && a.Name.LocalName == "x");
+        Assert.Equal(1, rootX);
+        // 非根元素不再有任何 xmlns 声明
+        var nested = root.Descendants().SelectMany(e => e.Attributes())
+            .Count(a => a.IsNamespaceDeclaration);
+        Assert.Equal(0, nested);
+        // 序列化文本里 xmlns:x 只出现在根元素行
+        var occurrences = System.Text.RegularExpressions.Regex.Matches(r.Xaml, "xmlns:x").Count;
+        Assert.Equal(1, occurrences);
+    }
+
+    [Fact]
+    public void AdornerDecorator_IsUnwrapped_AttributesTransferred()
+    {
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition />
+                        <RowDefinition />
+                    </Grid.RowDefinitions>
+                    <AdornerDecorator Grid.Row="1">
+                        <Grid>
+                            <TextBlock Text="Content" />
+                        </Grid>
+                    </AdornerDecorator>
+                </Grid>
+            </Window>
+            """);
+
+        Assert.DoesNotContain("AdornerDecorator", r.Xaml);
+        // 布局特性转移给首个子元素（Grid.Row=1）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        var innerGrid = doc.Descendants().First(d => d.Name.LocalName == "Grid" &&
+            d.Elements().Any(c => c.Name.LocalName == "TextBlock"));
+        Assert.Equal("1", innerGrid.Attribute("Grid.Row")?.Value);
+        Assert.Contains("Text=\"Content\"", r.Xaml);
     }
 
     [Fact]

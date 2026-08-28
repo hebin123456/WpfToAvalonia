@@ -109,18 +109,37 @@ public sealed partial class XamlTransformer
 
     private void VisitElement(XElement el, ref bool usesDataGrid, ref string? startupUri)
     {
+        // —— 反编译冗余 xmlns：非根元素声明上提/去除（Avalonia 编译器仅允许根声明，AXN0003） ——
+        if (!ReferenceEquals(el, _root))
+            HoistNamespaceDeclarations(el);
+
         var ns = el.Name.NamespaceName;
         var local = el.Name.LocalName;
         var isAvaloniaNs = ns == KnownMaps.AvaloniaNs;
 
         if (isAvaloniaNs)
         {
+            // —— GridView 列视图体系：整体注释移除（Avalonia 无列视图；DataGrid 是另一套机制） ——
+            if (KnownMaps.GridViewFamilyElements.Contains(local))
+            {
+                ReplaceWithComment(el, "XAML-GRIDVIEW",
+                    $"<{local}>（WPF ListView 列视图体系）在 Avalonia 核心无等价物，已移除；" +
+                    "多列列表请用 ListBox + DataTemplate（Grid 列布局）重建，列头用 Grid 手工实现（或引入 Avalonia.Controls.DataGrid 包）。");
+                return;
+            }
+
+            // —— AdornerDecorator：解包（WPF 模板装饰层包装，Avalonia 无装饰器层） ——
+            if (local == "AdornerDecorator" && el.Parent != null)
+            {
+                UnwrapAdornerDecorator(el, ref usesDataGrid, ref startupUri);
+                return;
+            }
+
             // —— 无等价物元素：保留 + 人工提示 ——
             if (KnownMaps.UnsupportedElements.Contains(local))
             {
                 Note(el, NoteSeverity.Manual, "XAML-UNSUPPORTED-ELEMENT",
-                    $"元素 <{local}> 在 Avalonia 核心中无直接等价物，需人工替换（社区库或自定义控件）。" +
-                    (local == "Hyperlink" ? "建议改用 HyperlinkButton 或 TextBlock+类样式，NavigateUri/RequestNavigate 需重写。" : ""));
+                    $"元素 <{local}> 在 Avalonia 核心中无直接等价物，需人工替换（社区库或自定义控件）。");
             }
 
             // —— 元素重命名 ——
@@ -162,6 +181,49 @@ public sealed partial class XamlTransformer
                                 "PathGeometry 含 PathFigure 子元素，Avalonia StreamGeometry 仅支持迷你语言，需人工重写。");
                         }
                     }
+
+                    // —— 属性元素所有者前缀随元素重命名同步：<Hyperlink.NavigateUri> → <HyperlinkButton.NavigateUri> ——
+                    var ownerPrefix = local + ".";
+                    foreach (var propEl in el.Elements()
+                                 .Where(c => c.Name.LocalName.StartsWith(ownerPrefix, StringComparison.Ordinal)).ToList())
+                    {
+                        var newLocal = renamed + "." + propEl.Name.LocalName[(local.Length + 1)..];
+                        propEl.Name = XName.Get(newLocal, propEl.Name.NamespaceName);
+                    }
+
+                    // —— ListView → ListBox：View 特性/属性元素（GridView 列视图）移除 ——
+                    if (local == "ListView")
+                    {
+                        var viewAttr = el.Attribute("View");
+                        if (viewAttr != null)
+                        {
+                            var viewValue = viewAttr.Value;
+                            viewAttr.Remove();
+                            Note(el, NoteSeverity.Manual, "XAML-LISTVIEW-VIEW",
+                                $"ListView.View=\"{viewValue}\" 已移除；Avalonia ListBox 无列视图，多列行请用 DataTemplate（Grid 列）重建。");
+                        }
+                        var viewEl = el.Elements().FirstOrDefault(c =>
+                            c.Name.LocalName is "ListView.View" or "View" or "ListBox.View");
+                        if (viewEl != null)
+                        {
+                            viewEl.Remove();
+                            Note(el, NoteSeverity.Manual, "XAML-LISTVIEW-VIEW",
+                                "<ListView.View>（GridView 列布局）已移除；Avalonia ListBox 用 DataTemplate 重建多列行，DisplayMemberBinding → 绑定表达式。");
+                        }
+                    }
+
+                    if (local == "RichTextBox")
+                    {
+                        Note(el, NoteSeverity.Manual, "XAML-RICHTEXTBOX",
+                            "RichTextBox → TextBox（纯文本降级）；Document/Selection/TextRange/CaretPosition API 无等价，代码侧需人工改写（富文本可考虑 AvaloniaEdit）。");
+                    }
+
+                    if (local == "Hyperlink")
+                    {
+                        Note(el, NoteSeverity.Manual, "XAML-HYPERLINK",
+                            "Hyperlink → HyperlinkButton；NavigateUri 属性保留，RequestNavigate 事件已移除——Click 处理器内用 Process.Start 打开链接（Avalonia 不会自动打开）。");
+                    }
+
                     Note(el, NoteSeverity.Info, "XAML-ELEMENT-RENAME", $"{local} → {renamed}。");
                     local = renamed;
                 }
@@ -714,6 +776,16 @@ public sealed partial class XamlTransformer
         }
 
         var targetType = StripXType(targetTypeRaw);
+
+        // —— TargetType 属 GridView 列视图体系（无 Avalonia 等价物）：整个主题注释移除 ——
+        if (KnownMaps.GridViewFamilyElements.Contains(targetType))
+        {
+            ReplaceWithComment(style, "XAML-GRIDVIEW-THEME",
+                $"TargetType={targetType} 的主题已随 GridView 列视图体系移除（Avalonia 无该控件）；" +
+                "列头样式请以 Grid/列布局手工重建。");
+            return;
+        }
+
         // 目标类型同步元素重命名（Label → TextBlock）
         if (KnownMaps.ElementRenames.TryGetValue(targetType, out var renamedType))
         {
@@ -1530,6 +1602,120 @@ public sealed partial class XamlTransformer
     }
 
     // ————————————————————————————————— 工具 —————————————————————————————————
+
+    /// <summary>
+    /// 反编译风格 XAML 把 xmlns 声明重复散布在嵌套元素上；Avalonia XAML 编译器要求
+    /// xmlns 只在根元素声明（否则 AXN0003 警告 + 运行时加载失败）。处理策略：
+    /// 同前缀同 URI → 冗余去除；根未声明该前缀 → 上提到根；同前缀异 URI（罕见冲突）→ 保留 + Manual 提示。
+    /// </summary>
+    private void HoistNamespaceDeclarations(XElement el)
+    {
+        foreach (var attr in el.Attributes().ToList())
+        {
+            if (!attr.IsNamespaceDeclaration) continue;
+            var isDefault = attr.Name.Namespace == XNamespace.None; // xmlns="..."（否则 xmlns:prefix）
+            var prefix = isDefault ? "" : attr.Name.LocalName;
+            var uri = attr.Value;
+
+            var rootDecl = _root.Attributes().FirstOrDefault(a => a.IsNamespaceDeclaration &&
+                (a.Name.Namespace == XNamespace.None ? "" : a.Name.LocalName) == prefix);
+
+            if (rootDecl == null)
+            {
+                if (isDefault)
+                {
+                    // 根元素带前缀（Name.Namespace 非空）时上提安全：根名不受默认 ns 影响，
+                    // 后代沿用根默认绑定；根若为无命名空间的裸元素则上提会改变根语义 → 保守保留
+                    if (_root.Name.Namespace != XNamespace.None)
+                    {
+                        attr.Remove();
+                        _root.SetAttributeValue("xmlns", uri);
+                    }
+                    else
+                    {
+                        Note(el, NoteSeverity.Manual, "XAML-NS-HOIST",
+                            $"嵌套默认 xmlns 声明（{uri}）保留原位：根元素无前缀且无默认命名空间，上提会改变根语义，请人工归一到根。");
+                    }
+                }
+                else
+                {
+                    attr.Remove();
+                    _root.SetAttributeValue(XNamespace.Xmlns + prefix, uri);
+                }
+            }
+            else if (rootDecl.Value == uri)
+            {
+                attr.Remove(); // 与根声明一致：冗余，直接去除
+            }
+            else
+            {
+                // 同前缀异 URI（反编译器在不同作用域用了同名前缀）：
+                // 子树元素已按展开名（完整 URI）保存，序列化时自动套用根级绑定。
+                // 根已有某前缀绑定该 URI → 幂等去除；否则重命名为根级全新前缀
+                attr.Remove();
+                var existing = _root.Attributes().FirstOrDefault(a => a.IsNamespaceDeclaration && a.Value == uri);
+                if (existing != null)
+                {
+                    Note(el, NoteSeverity.Info, "XAML-NS-CONFLICT",
+                        $"嵌套 xmlns（{(prefix.Length == 0 ? "默认" : prefix + ":")} → {uri}）与根声明（{rootDecl.Value}）冲突：" +
+                        $"根已有 {existing.Name.LocalName}: 绑定同 URI，已去除嵌套声明，子树自动改用该前缀。");
+                }
+                else
+                {
+                    var fresh = MakeFreshPrefix(prefix);
+                    _root.SetAttributeValue(XNamespace.Xmlns + fresh, uri);
+                    Note(el, NoteSeverity.Warning, "XAML-NS-CONFLICT",
+                        $"嵌套 xmlns（{(prefix.Length == 0 ? "默认" : prefix + ":")} → {uri}）与根声明（{rootDecl.Value}）冲突：" +
+                        $"已改为根级前缀 {fresh}:（子树元素引用随序列化自动更新，双方语义保留）。");
+                }
+            }
+        }
+    }
+
+    /// <summary>生成未与根声明冲突的全新前缀（原前缀 + 数字后缀，避免 xml/xmlns 保留字）。</summary>
+    private string MakeFreshPrefix(string basePrefix)
+    {
+        var taken = new HashSet<string>(_root.Attributes().Where(a => a.IsNamespaceDeclaration)
+            .Select(a => a.Name.Namespace == XNamespace.None ? "xmlns" : a.Name.LocalName));
+        var b = basePrefix.Length == 0 ? "ns" : basePrefix;
+        if (b is "xml" or "xmlns") b += "0";
+        var candidate = b;
+        var i = 1;
+        while (taken.Contains(candidate))
+            candidate = b + i++;
+        return candidate;
+    }
+
+    /// <summary>
+    /// AdornerDecorator 解包：WPF ControlTemplate 中的装饰层包装器，Avalonia 无装饰器体系。
+    /// 子元素上提至父级原位置，布局特性（Grid.Row 等）转移给首个子元素；
+    /// 上提的子元素需手动递归访问（父级遍历快照在解包前已生成，不会覆盖到它们）。
+    /// </summary>
+    private void UnwrapAdornerDecorator(XElement el, ref bool usesDataGrid, ref string? startupUri)
+    {
+        var children = el.Elements().ToList();
+        var attrs = el.Attributes().Where(a => !a.IsNamespaceDeclaration).ToList();
+        var first = children.FirstOrDefault();
+
+        foreach (var a in attrs)
+        {
+            a.Remove();
+            // 布局附加属性转移给首个子元素（Grid.Row/Grid.Column 等）；子元素已有时跳过
+            if (first != null && first.Attribute(a.Name) == null)
+                first.SetAttributeValue(a.Name, a.Value);
+        }
+
+        foreach (var c in children)
+            el.AddBeforeSelf(c); // 依原顺序插入到包装器之前（移动语义）
+        el.Remove();
+
+        Note(first ?? el, NoteSeverity.Info, "XAML-ADORNERDECORATOR",
+            "AdornerDecorator 已解包（Avalonia 无装饰器层；WPF 模板中的包装器不迁移），布局特性已转移给首个子元素。");
+
+        // 上提的子元素补访问（父级 Elements().ToList() 快照未包含它们）
+        foreach (var c in children)
+            VisitElement(c, ref usesDataGrid, ref startupUri);
+    }
 
     private void ReplaceWithComment(XElement el, string rule, string message)
     {
