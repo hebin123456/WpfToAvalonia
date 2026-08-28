@@ -45,7 +45,7 @@ public sealed class ProjectConverter
             }
         }
 
-        // ---------- 1. XAML ----------
+        // ---------- 1. XAML（两遍式：预扫描收集跨文件资源键，再统一转换） ----------
         bool usesDataGrid = false;
         string? appXamlPath = null;
         string? startupUri = null;
@@ -55,7 +55,15 @@ public sealed class ProjectConverter
             .OrderBy(p => p.Length)
             .ToList();
 
-        var xamlTransformer = new XamlTransformer(assemblyName);
+        // 预扫描：ForkPlus 的资源经字典链合并（App → Generic → Styles/*.xaml），
+        // 键与主题跨文件可见，转换前收集全局键集合供引用判定（BasedOn 自动补链 / B2V 解包）
+        var styleKeys = new HashSet<string>(StringComparer.Ordinal);
+        var typeThemeKeys = new HashSet<string>(StringComparer.Ordinal);
+        var booleanToVisibilityKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var xaml in xamlFiles)
+            PreScanKeys(File.ReadAllText(xaml), styleKeys, typeThemeKeys, booleanToVisibilityKeys);
+
+        var xamlTransformer = new XamlTransformer(assemblyName, styleKeys, typeThemeKeys, booleanToVisibilityKeys);
         foreach (var xaml in xamlFiles)
         {
             var rel = Path.GetRelativePath(dir, xaml);
@@ -96,14 +104,6 @@ public sealed class ProjectConverter
         {
             var appAxaml = Path.ChangeExtension(appXamlPath, ".axaml");
             if (File.Exists(appAxaml)) EnsureDataGridTheme(appAxaml, dir);
-        }
-
-        // 纯样式字典引用迁移：ResourceInclude/ResourceDictionary[Source] → 宿主 .Styles 内的 StyleInclude
-        if (!_options.DryRun)
-        {
-            foreach (var axaml in Directory.EnumerateFiles(dir, "*.axaml", SearchOption.AllDirectories)
-                         .Where(p => !IsUnderObjBin(p)).ToList())
-                MigrateStyleIncludes(axaml, dir);
         }
 
         // ---------- 2. 启动窗口类型 ----------
@@ -209,114 +209,32 @@ public sealed class ProjectConverter
     }
 
     /// <summary>
-    /// 若 Resources 中引用的字典文件已转换为纯 Styles 根（仅含样式），
-    /// 则把引用改为 StyleInclude 并迁移到宿主 .Styles 集合，保证选择器生效。
+    /// XAML 预扫描：收集跨文件资源键（文本级正则，解析失败的文件不阻塞扫描）。
+    /// styleKeys：命名键（Style x:Key / 直接资源）；typeThemeKeys：类型键
+    /// （{x:Type X} 的 x:Key 及全部 TargetType，keyless 样式转换后亦成类型键）；
+    /// booleanToVisibilityKeys：BooleanToVisibilityConverter 的键（元素将被删除，绑定解包需键匹配）。
     /// </summary>
-    private void MigrateStyleIncludes(string axamlPath, string dir)
+    private static void PreScanKeys(string source,
+        HashSet<string> styleKeys, HashSet<string> typeThemeKeys, HashSet<string> booleanToVisibilityKeys)
     {
-        var text = File.ReadAllText(axamlPath);
-        if (!text.Contains("ResourceInclude", StringComparison.Ordinal) &&
-            !text.Contains("ResourceDictionary", StringComparison.Ordinal)) return;
-
-        XDocument doc;
-        try { doc = XDocument.Parse(text, LoadOptions.PreserveWhitespace); }
-        catch { return; }
-        var root = doc.Root;
-        if (root == null) return;
-
-        var includes = root.Descendants()
-            .Where(e => e.Name.LocalName is "ResourceInclude" or "ResourceDictionary"
-                        && e.Attribute("Source") != null)
-            .ToList();
-
-        bool changed = false;
-        foreach (var inc in includes)
+        foreach (Match m in Regex.Matches(source, @"x:Key\s*=\s*""(?<key>[^""]+)"""))
         {
-            var src = inc.Attribute("Source")!.Value;
-            var target = ResolveLocalAssetPath(src, dir);
-            if (target == null || !File.Exists(target)) continue;
-
-            string targetRootName;
-            try { targetRootName = XDocument.Load(target).Root?.Name.LocalName ?? ""; }
-            catch { continue; }
-            if (targetRootName != "Styles") continue;
-
-            // 找到包含该引用的 .Resources 所属宿主控件
-            var host = inc.Ancestors()
-                .FirstOrDefault(a => a.Name.LocalName.EndsWith(".Resources", StringComparison.Ordinal) ||
-                                     a.Name.LocalName == "Resources" ||
-                                     a.Name.LocalName.EndsWith(".MergedDictionaries", StringComparison.Ordinal))
-                ?.Parent ?? root;
-            if (host != root && host.Name.LocalName == "ResourceDictionary")
-                host = root; // 兜底：嵌套字典内的引用归到根
-
-            var styles = GetOrCreateStyles(host);
-            var container = inc.Parent; // Remove 后 Parent 变 null，需先捕获
-            inc.Remove();
-            var styleInclude = new XElement(XName.Get("StyleInclude", root.Name.NamespaceName),
-                new XAttribute("Source", src));
-            styles.Add(new XText("\n    "), styleInclude);
-
-            PruneEmptyContainers(container);
-            changed = true;
-            _report.Add(new ConversionNote(Path.GetRelativePath(dir, axamlPath), 0, NoteSeverity.Info,
-                "XAML-STYLES-INCLUDE",
-                $"{Path.GetFileName(target)} 是纯样式字典：ResourceInclude → StyleInclude 并移入 {host.Name.LocalName}.Styles。"));
+            var key = m.Groups["key"].Value.Trim();
+            if (key.StartsWith("{x:Type", StringComparison.Ordinal))
+                typeThemeKeys.Add(key);
+            else if (key.Length > 0)
+                styleKeys.Add(key);
         }
 
-        if (changed)
-        {
-            doc.Declaration = null;
-            File.WriteAllText(axamlPath, doc.ToString(SaveOptions.None));
-        }
-    }
+        // 全部 TargetType 均构成类型键（keyless 样式转换后补 {x:Type T} 键）
+        foreach (Match m in Regex.Matches(source,
+                     @"TargetType\s*=\s*""(?:\{x:Type\s+)?(?<type>[\w:.]+)\}?"""))
+            typeThemeKeys.Add($"{{x:Type {m.Groups["type"].Value.Trim()}}}");
 
-    private static XElement GetOrCreateStyles(XElement host)
-    {
-        var hostLocal = host.Name.LocalName;
-        var found = host.Elements().FirstOrDefault(e =>
-            e.Name.LocalName == "Styles" || e.Name.LocalName == hostLocal + ".Styles");
-        if (found != null) return found;
-
-        var created = new XElement(XName.Get($"{hostLocal}.Styles", host.Name.NamespaceName), new XText("\n    "));
-        // 插在第一个非 .Resources 属性元素之前，保持 XAML 惯例（样式在资源后）
-        var anchor = host.Elements().FirstOrDefault(e => !e.Name.LocalName.EndsWith(".Resources", StringComparison.Ordinal));
-        if (anchor != null) anchor.AddBeforeSelf(created, new XText("\n    "));
-        else host.Add(created);
-        return created;
-    }
-
-    /// <summary>删除迁移后变空的 MergedDictionaries / ResourceDictionary / .Resources 容器。</summary>
-    private static void PruneEmptyContainers(XElement? prop)
-    {
-        if (prop == null) return;
-        if (!prop.Name.LocalName.EndsWith(".MergedDictionaries", StringComparison.Ordinal) || prop.Elements().Any())
-            return;
-
-        var dict = prop.Parent;
-        prop.Remove();
-        if (dict == null) return;
-        if (dict.Name.LocalName == "ResourceDictionary" && !dict.Elements().Any() &&
-            dict.Parent?.Name.LocalName.EndsWith(".Resources", StringComparison.Ordinal) == true)
-        {
-            dict.Parent.Remove(); // 整个 .Resources 已空
-        }
-    }
-
-    private static string? ResolveLocalAssetPath(string source, string dir)
-    {
-        if (source.StartsWith("avares://", StringComparison.OrdinalIgnoreCase))
-        {
-            var rest = source["avares://".Length..];
-            var slash = rest.IndexOf('/');
-            if (slash < 0) return null;
-            // avares://<程序集>/<路径>：按本工程目录解析（忽略程序集名差异）
-            var path = rest[(slash + 1)..];
-            var candidate = Path.GetFullPath(Path.Combine(dir, path));
-            return File.Exists(candidate) ? candidate : Path.GetFullPath(Path.Combine(dir, rest));
-        }
-        if (source.StartsWith('/')) return Path.GetFullPath(Path.Combine(dir, source.TrimStart('/')));
-        return Path.GetFullPath(Path.Combine(dir, source));
+        // BooleanToVisibilityConverter：<BooleanToVisibilityConverter x:Key="X" .../>
+        foreach (Match m in Regex.Matches(source,
+                     @"<BooleanToVisibilityConverter[^>]*?\bx:Key\s*=\s*""(?<key>[^""]+)"""))
+            booleanToVisibilityKeys.Add(m.Groups["key"].Value.Trim());
     }
 
     private void EnsureDataGridTheme(string appAxamlPath, string projectDir)

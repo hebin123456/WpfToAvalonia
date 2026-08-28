@@ -17,6 +17,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private readonly string _file;
     private readonly List<ConversionNote> _notes = new();
     private readonly HashSet<string> _dedupe = new();
+    private int _resourceVarCounter;
 
     public bool WpfDetected { get; private set; }
     public IReadOnlyList<ConversionNote> Notes => _notes;
@@ -48,6 +49,29 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         "CompositionTarget.Rendering", "EventManager.RegisterRoutedEvent",
         "FocusManager.GetFocusedElement", "Application.Current.Windows",
         "new System.Windows.MessageBox", "Toolbar",
+    };
+
+    /// <summary>后缀模式（成员调用 receiver.Xxx）：Xxx 部分需人工处理。</summary>
+    private static readonly (string Suffix, string Rule, string Message)[] ManualNoteSuffixPatterns =
+    {
+        (".SetResourceReference", "CS-SETRESOURCE-REF",
+            "SetResourceReference（动态资源重定向）无 Avalonia 等价；请改用 {DynamicResource} XAML 绑定或代码里重建绑定。"),
+        (".CaptureMouse", "CS-CAPTURE",
+            "CaptureMouse/ReleaseMouseCapture → control.Pointer.Capture(pointer)/ReleasePointerCapture（基于 Pointer 实例）。"),
+        (".DoDragDrop", "CS-DRAGDROP",
+            "DoDragDrop → TopLevel.Clipboard 或 DragDrop.DoDragDrop（Avalonia.Input.DragDrop，基于 DataObject 与 pointer）。"),
+        (".PrintVisual", "CS-PRINT", "WPF 打印体系无 Avalonia 等价，需平台特定实现。"),
+        (".ShowDialog", "CS-SHOWDIALOG2",
+            "ShowDialog() 无参形式：Avalonia 需要 owner 参数 await dialog.ShowDialog(owner)。"),
+    };
+
+    /// <summary>前缀模式（泛型/静态类调用）。</summary>
+    private static readonly (string Prefix, string Rule, string Message)[] ManualNotePrefixPatterns =
+    {
+        ("WeakEventManager<", "CS-WEAKEVENT",
+            "WeakEventManager<TS,TA>.AddHandler(s, \"Event\", h) → Avalonia WeakEvent 系统：事件宿主用 static WeakEvent<TS,TA> 字段 + AddHandler/RemoveHandler；字符串事件名无法保留。"),
+        ("VisualTreeHelper.", "CS-VISUALTREE2",
+            "VisualTreeHelper.* → VisualTree 扩展（GetVisualChildren/GetVisualParent/FindDescendant 等，Avalonia 命名空间）。"),
     };
 
     public WpfCSharpRewriter(string file) => _file = file;
@@ -96,9 +120,30 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         switch (text)
         {
             case "Application.Current.Dispatcher":
+            case "Application.Current?.Dispatcher":
+            case "global::Avalonia.Application.Current.Dispatcher":
+            case "global::Avalonia.Application.Current?.Dispatcher":
                 WpfDetected = true;
                 Note(node, NoteSeverity.Info, "CS-DISPATCHER", "Application.Current.Dispatcher → Avalonia.Threading.Dispatcher.UIThread");
                 return Expr(node, "global::Avalonia.Threading.Dispatcher.UIThread");
+
+            case "Application.Current.MainWindow":
+            case "Application.Current?.MainWindow":
+            case "global::Avalonia.Application.Current.MainWindow":
+            case "global::Avalonia.Application.Current?.MainWindow":
+                WpfDetected = true;
+                Note(node, NoteSeverity.Info, "CS-MAINWINDOW",
+                    "Application.Current.MainWindow → (ApplicationLifetime as IClassicDesktopStyleApplicationLifetime)?.MainWindow");
+                return Expr(node,
+                    "(global::Avalonia.Application.Current?.ApplicationLifetime as global::Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?.MainWindow");
+
+            case "Application.Current.Windows":
+            case "global::Avalonia.Application.Current.Windows":
+                WpfDetected = true;
+                Note(node, NoteSeverity.Info, "CS-WINDOWS-COLLECTION",
+                    "Application.Current.Windows → lifetime.Windows（IClassicDesktopStyleApplicationLifetime.Windows 集合）");
+                return Expr(node,
+                    "(global::Avalonia.Application.Current?.ApplicationLifetime as global::Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?.Windows");
 
             case "Dispatcher.CurrentDispatcher":
                 WpfDetected = true;
@@ -149,6 +194,28 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         return base.VisitIdentifierName(node);
     }
 
+    // ------------------------------------------------------------------ 语句删除
+
+    /// <summary>
+    /// 无参 Freeze()/BeginInit()/EndInit() 语句整句删除：
+    /// Avalonia 无冻结概念（Brush/Bitmap 均为不可变值语义），
+    /// 亦无 BitmapImage 的 BeginInit/EndInit 初始化协议。
+    /// </summary>
+    public override SyntaxNode? VisitExpressionStatement(ExpressionStatementSyntax node)
+    {
+        if (node.Expression is InvocationExpressionSyntax inv &&
+            inv.ArgumentList.Arguments.Count == 0 &&
+            inv.Expression is MemberAccessExpressionSyntax ma &&
+            ma.Name.Identifier.ValueText is "Freeze" or "BeginInit" or "EndInit")
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-FREEZE-REMOVED",
+                $"{node.Expression} 语句已删除（Avalonia 无冻结/初始化协议，资源对象不可变）。");
+            return null; // 从语句列表中移除
+        }
+        return base.VisitExpressionStatement(node);
+    }
+
     // ------------------------------------------------------------------ 调用点
 
     public override SyntaxNode? VisitInvocationExpression(InvocationExpressionSyntax node)
@@ -193,6 +260,46 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                     "VisualTreeHelper.GetParent → VisualTreeExtensions.GetVisualParent（Avalonia 命名空间）");
                 return Expr(node, $"global::Avalonia.VisualTreeExtensions.GetVisualParent({arg})");
             }
+        }
+
+        // Dispatcher.Yield（WPF 静态）→ Dispatcher.UIThread.Yield（Avalonia 实例方法，Yield(DispatcherPriority) 存在）
+        if (node.Expression is MemberAccessExpressionSyntax yma &&
+            yma.Name.Identifier.ValueText == "Yield" &&
+            ((yma.Expression is IdentifierNameSyntax yid && yid.Identifier.ValueText == "Dispatcher") ||
+             yma.Expression.ToString().EndsWith(".Dispatcher", StringComparison.Ordinal)))
+        {
+            WpfDetected = true;
+            var args = node.ArgumentList.Arguments.Count > 0
+                ? node.ArgumentList.Arguments.Select(a => a.ToString()).Aggregate((l, r) => $"{l}, {r}")
+                : "";
+            Note(node, NoteSeverity.Info, "CS-DISPATCHER-YIELD",
+                "Dispatcher.Yield(...)（静态）→ Dispatcher.UIThread.Yield(...)（实例方法，返回 DispatcherPriorityAwaitable）。");
+            return Expr(node,
+                $"global::Avalonia.Threading.Dispatcher.UIThread.Yield({args})");
+        }
+
+        // ForkPlus 自定义 Dispatcher 扩展：Dispatcher.Async(action)（= BeginInvoke）→ Post(action)
+        if (node.Expression is MemberAccessExpressionSyntax ama &&
+            ama.Name.Identifier.ValueText == "Async" &&
+            ama.Expression.ToString().Contains("Dispatcher", StringComparison.Ordinal))
+        {
+            var receiver = ama.Expression.ToString();
+            // Application.Current?.Dispatcher 在 Avalonia Application 上不存在 → Dispatcher.UIThread
+            if (receiver.Contains("Application.Current", StringComparison.Ordinal))
+            {
+                WpfDetected = true;
+                var args = node.ArgumentList.Arguments.Count > 0
+                    ? node.ArgumentList.Arguments.Select(a => a.ToString()).Aggregate((l, r) => $"{l}, {r}")
+                    : "";
+                Note(node, NoteSeverity.Info, "CS-DISPATCHER-ASYNC",
+                    "Application.Current?.Dispatcher.Async(action) → Dispatcher.UIThread.Post(action)（Avalonia Application 无 Dispatcher 属性，统一走 UI 线程调度器）。");
+                return Expr(node, $"global::Avalonia.Threading.Dispatcher.UIThread.Post({args})");
+            }
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-DISPATCHER-ASYNC",
+                $"{receiver}.Async(action)（BeginInvoke 封装）→ {receiver}.Post(action)（fire-and-forget，返回 void）。");
+            return node.WithExpression(
+                ama.WithName(SyntaxFactory.IdentifierName("Post").WithTriviaFrom(ama.Name)));
         }
 
         // Dispatcher.BeginInvoke → Post
@@ -301,7 +408,65 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             Note(node, NoteSeverity.Manual, "CS-SHOWDIALOG",
                 "ShowDialog() 返回 bool? 的比较需改为 await ShowDialog(owner)（Task<object?>），方法需标记 async。");
         }
+
+        // as 模式：GetTemplateChild("PART_X") as T → this.FindControl<T>("PART_X")
+        if (node.IsKind(SyntaxKind.AsExpression) &&
+            node.Left is InvocationExpressionSyntax inv &&
+            inv.Expression is MemberAccessExpressionSyntax invMa &&
+            invMa.Name.Identifier.ValueText == "GetTemplateChild")
+        {
+            var name = inv.ArgumentList.Arguments.FirstOrDefault()?.ToString() ?? "\"\"";
+            var type = node.Right.ToString();
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-TEMPLATECHILD",
+                $"GetTemplateChild({name}) as {type} → this.FindControl<{type}>({name})（模板部件在 NameScope 注册；OnApplyTemplate 虚方法在 Avalonia TemplatedControl 上存在）。");
+            return Expr(node, $"this.FindControl<{type}>({name})");
+        }
+
+        // as 模式：FindResource(key) as T → TryGetResource 三元（唯一变量名避免作用域冲突）
+        if (node.IsKind(SyntaxKind.AsExpression) &&
+            node.Left is InvocationExpressionSyntax resInv &&
+            resInv.Expression is IdentifierNameSyntax resId &&
+            resId.Identifier.ValueText == "FindResource")
+        {
+            var key = resInv.ArgumentList.Arguments.FirstOrDefault()?.ToString() ?? "null";
+            var type = node.Right.ToString();
+            var varName = $"__res{_resourceVarCounter++}";
+            WpfDetected = true;
+            Note(node, NoteSeverity.Warning, "CS-FINDRESOURCE",
+                $"FindResource({key}) as {type} → TryGetResource({key}, ActualThemeVariant, out var {varName}) 三元式（沿逻辑树查找语义保留；找不到返回 null 而非抛异常）。");
+            return Expr(node,
+                $"(this.TryGetResource({key}, ActualThemeVariant, out var {varName}) ? {varName} as {type} : null)");
+        }
+
         return base.VisitBinaryExpression(node);
+    }
+
+    // ------------------------------------------------------------------ 字符串字面量（pack URI）
+
+    /// <summary>pack://application:,,,/Asm;component/Path → avares://Asm/Path（C# 侧资产 URI 统一）。</summary>
+    public override SyntaxNode? VisitLiteralExpression(LiteralExpressionSyntax node)
+    {
+        if (node.IsKind(SyntaxKind.StringLiteralExpression))
+        {
+            var text = node.Token.Text;
+            var inner = text.StartsWith("@\"", StringComparison.Ordinal)
+                ? text[2..^1]
+                : text.StartsWith("\"", StringComparison.Ordinal) ? text[1..^1] : text;
+            if (inner.StartsWith("pack://application:,,,/", StringComparison.Ordinal))
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(inner,
+                    @"^pack://application:,,,/(?<asm>[^;/,]+);component/(?<rest>.+)$");
+                if (m.Success)
+                {
+                    WpfDetected = true;
+                    var avares = $"avares://{m.Groups["asm"].Value}/{m.Groups["rest"].Value}";
+                    Note(node, NoteSeverity.Info, "CS-PACK-URI", $"\"{inner}\" → \"{avares}\"（Avalonia 资产 URI）。");
+                    return SyntaxFactory.ParseExpression($"\"{avares}\"").WithTriviaFrom(node);
+                }
+            }
+        }
+        return base.VisitLiteralExpression(node);
     }
 
     // ------------------------------------------------------- 依赖属性字段重写
@@ -402,6 +567,18 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             Note(node, NoteSeverity.Manual, "CS-ONPROPERTYCHANGED",
                 "OnPropertyChanged(DependencyPropertyChangedEventArgs) 签名不同；Avalonia 请重写 OnPropertyChanged<T>(AvaloniaPropertyChangedEventArgs<T>)。");
         }
+
+        // OnRender(DrawingContext)：custom drawing 体系差异
+        if (node.Identifier.ValueText == "OnRender" &&
+            node.ParameterList.Parameters.Count == 1 &&
+            node.ParameterList.Parameters[0].Type?.ToString().Contains("DrawingContext") == true)
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Manual, "CS-ONRENDER",
+                "OnRender(DrawingContext) → Avalonia 自绘需继承 CustomDrawingControl / Control + Render(DrawingContext)（context.Context），DrawingContext API（DrawGeometry/DrawRectangle 参数）与 WPF 不同，需逐调用改写。");
+        }
+
+        // WPF OnApplyTemplate 在 Avalonia TemplatedControl 上存在（protected virtual），签名相同 → 保留
         return base.VisitMethodDeclaration(node);
     }
 
@@ -430,6 +607,26 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     /// <summary>对无法自动转换的 API 记录一次 TODO（每文件每模式去重）。</summary>
     private void ManualNote(SyntaxNode node, string pattern)
     {
+        // 后缀模式：receiver.SetResourceReference(...) 等
+        foreach (var (suffix, ruleId, message) in ManualNoteSuffixPatterns)
+        {
+            if (!pattern.EndsWith(suffix, StringComparison.Ordinal)) continue;
+            if (!_dedupe.Add(suffix)) return;
+            WpfDetected = true;
+            Note(node, NoteSeverity.Manual, ruleId, message);
+            return;
+        }
+
+        // 前缀模式：WeakEventManager<...> / VisualTreeHelper.* 等
+        foreach (var (prefix, ruleId, message) in ManualNotePrefixPatterns)
+        {
+            if (!pattern.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            if (!_dedupe.Add(prefix)) return;
+            WpfDetected = true;
+            Note(node, NoteSeverity.Manual, ruleId, message);
+            return;
+        }
+
         var matched = ManualNoteOncePatterns.FirstOrDefault(p =>
             pattern.Equals(p, StringComparison.Ordinal) ||
             (p.StartsWith("new ", StringComparison.Ordinal) && pattern.EndsWith(p[4..], StringComparison.Ordinal)));

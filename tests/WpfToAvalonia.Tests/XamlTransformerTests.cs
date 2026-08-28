@@ -445,4 +445,38 @@ public class XamlTransformerTests
         // 容器样式内的 Style 同步转 ControlTheme
         Assert.Contains("<ControlTheme", r.Xaml);
     }
+
+    [Fact]
+    public void LabelTypeKey_RenamesTogetherWithTargetType()
+    {
+        var r = new XamlTransformer("TestApp").Transform("""
+            <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Style x:Key="{x:Type Label}" TargetType="{x:Type Label}">
+                    <Setter Property="FontSize" Value="12" />
+                </Style>
+            </ResourceDictionary>
+            """, "Styles/L.xaml");
+
+        // Label → TextBlock：类型键与 TargetType 同步重命名（否则键与目标类型不一致）
+        Assert.Contains("x:Key=\"{x:Type TextBlock}\"", r.Xaml);
+        Assert.Contains("TargetType=\"TextBlock\"", r.Xaml);
+        Assert.DoesNotContain("{x:Type Label}", r.Xaml);
+    }
+
+    [Fact]
+    public void StyleReferenceToRenamedTypeKey_IsSynced()
+    {
+        var r = new XamlTransformer("TestApp",
+            typeThemeKeys: new HashSet<string> { "{x:Type Label}", "{x:Type TextBlock}" })
+            .Transform("""
+                <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                    <ContentControl Style="{StaticResource {x:Type Label}}" />
+                </Window>
+                """, "W.xaml");
+
+        // 引用处的类型键也随 Label → TextBlock 重命名
+        Assert.Contains("Theme=\"{StaticResource {x:Type TextBlock}}\"", r.Xaml);
+    }
 }

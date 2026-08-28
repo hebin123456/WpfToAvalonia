@@ -374,12 +374,17 @@ public sealed partial class XamlTransformer
                 if (m.Success)
                 {
                     var key = m.Groups["key"].Value.Trim();
+                    // 类型键引用随元素重命名同步（{x:Type Label} → {x:Type TextBlock}）
+                    if (key.StartsWith("{x:Type", StringComparison.Ordinal))
+                        key = RemapTypeKey(key, out var remapped);
+                    var kind = m.Groups["kind"].Value;
+                    var newValue = $"{{{kind}Resource {key}}}";
                     attr.Remove();
-                    el.SetAttributeValue("Theme", value);
+                    el.SetAttributeValue("Theme", newValue);
                     var known = _styleKeys.Contains(key) ||
                                 (key.StartsWith("{x:Type", StringComparison.Ordinal) && _typeThemeKeys.Contains(key));
                     Note(el, known ? NoteSeverity.Info : NoteSeverity.Warning, "XAML-STYLE-REFERENCE",
-                        $"Style=\"{value}\" → Theme=\"{value}\"（keyed 样式已转为 ControlTheme，经 Theme 属性引用）。" +
+                        $"Style=\"{value}\" → Theme=\"{newValue}\"（keyed 样式已转为 ControlTheme，经 Theme 属性引用）。" +
                         (known ? "" : "引用键未在扫描中发现，请确认其定义已转为 ControlTheme。"));
                 }
                 else
@@ -389,6 +394,24 @@ public sealed partial class XamlTransformer
                         $"Style=\"{value}\" 无法转换（非资源引用）；Avalonia 控件没有 Style 属性，请人工改用 Theme/Classes。");
                 }
                 continue;
+            }
+
+            // Theme={StaticResource {x:Type Label}} 引用键同步重命名
+            if (name == "Theme")
+            {
+                var m = StyleResourceRegex().Match(value);
+                if (m.Success)
+                {
+                    var key = m.Groups["key"].Value.Trim();
+                    var remapped = false;
+                    if (key.StartsWith("{x:Type", StringComparison.Ordinal))
+                        key = RemapTypeKey(key, out remapped);
+                    if (remapped)
+                    {
+                        var kind = m.Groups["kind"].Value;
+                        attr.Value = $"{{{kind}Resource {key}}}";
+                    }
+                }
             }
 
             // BasedOn：x:Type 直接形式 → StaticResource 形式
@@ -707,6 +730,18 @@ public sealed partial class XamlTransformer
         }
         else
         {
+            // 类型键随 TargetType 重命名同步（{x:Type Label} → {x:Type TextBlock}，否则键与目标类型不一致）
+            if (isTypeKey)
+            {
+                var newTypeKey = $"{{x:Type {targetType}}}";
+                if (!string.Equals(key, newTypeKey, StringComparison.Ordinal))
+                {
+                    keyAttr!.Value = newTypeKey;
+                    Note(style, NoteSeverity.Info, "XAML-TYPEKEY-RENAME",
+                        $"类型键 {key} → {newTypeKey}（随 TargetType 元素重命名同步，引用处资源键已同步更新）。");
+                    key = newTypeKey;
+                }
+            }
             Note(style, NoteSeverity.Info, "XAML-CONTROLTHEME",
                 $"Style x:Key=\"{key}\" TargetType=\"{targetType}\" → ControlTheme（TargetType 定位，键与引用处 Theme= 保持不变）。");
         }
@@ -1328,6 +1363,22 @@ public sealed partial class XamlTransformer
                                    el.ToString().Trim().Replace("\n", "\n      ") + "\n    ");
         el.ReplaceWith(comment);
         Note(el, NoteSeverity.Manual, rule, message);
+    }
+
+    /// <summary>
+    /// 类型键重映射：{x:Type Label} → {x:Type TextBlock}（元素重命名链同步）。
+    /// 未发生重命名时返回原键，remapped=false。
+    /// </summary>
+    private static string RemapTypeKey(string typeKey, out bool remapped)
+    {
+        remapped = false;
+        var m = XTypeRegex().Match(typeKey);
+        if (!m.Success) return typeKey;
+        var type = m.Groups["type"].Value.Trim();
+        if (!KnownMaps.ElementRenames.TryGetValue(type, out var renamed)) return typeKey;
+        var rt = renamed == "ContentControl" ? "TextBlock" : renamed;
+        remapped = true;
+        return $"{{x:Type {rt}}}";
     }
 
     private void Note(XObject node, NoteSeverity severity, string rule, string message)
