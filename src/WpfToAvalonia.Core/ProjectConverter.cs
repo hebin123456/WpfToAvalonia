@@ -343,7 +343,9 @@ public static class ConversionRunner
             foreach (Match m in Regex.Matches(File.ReadAllText(target),
                          @"Project\([^)]+\)\s*=\s*""[^""]+"",\s*""(?<path>[^""]+\.(?:csproj|vbproj))""", RegexOptions.IgnoreCase))
             {
-                var p = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(target))!, m.Groups["path"].Value));
+                // .sln 内路径使用 Windows 反斜杠分隔，非 Windows 平台需归一化
+                var slnRel = m.Groups["path"].Value.Replace('\\', '/');
+                var p = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(target))!, slnRel));
                 if (File.Exists(p) && p.EndsWith(".csproj")) projects.Add(p);
             }
         }

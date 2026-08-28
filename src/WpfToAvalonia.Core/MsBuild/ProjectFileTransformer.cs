@@ -15,6 +15,25 @@ public sealed class ProjectFileResult
 /// <summary>SDK 风格 csproj：去 WPF 化 → net10.0 → 挂 Avalonia 包 → 修正条目类型。</summary>
 public sealed class ProjectFileTransformer
 {
+    /// <summary>
+    /// 强制 Windows Desktop 目标（NETSDK1136）或纯 WPF 的包：
+    /// 注释隔离，保证转换后工程能以纯 net10.0 编译 XAML，后续人工替换。
+    /// Microsoft-WindowsAPICodePack-Shell 经真实构建验证触发 NETSDK1136。
+    /// </summary>
+    private static readonly (string Id, string Reason, string Replacement)[] QuarantinedPackages =
+    {
+        ("Microsoft-WindowsAPICodePack-Shell", "依赖 WPF（TaskDialog 等基于 WPF 实现）", "H.NotifyIcon / 平台对话框 API"),
+        ("Extended.Wpf.Toolkit", "WPF 控件库", "Avalonia 社区控件或手工实现"),
+        ("MahApps.Metro", "WPF 控件库", "FluentTheme + 手工样式"),
+        ("MaterialDesignThemes", "WPF 控件库", "FluentTheme + 手工样式"),
+        ("MaterialDesignColors", "WPF 调色板", "Avalonia 主题资源"),
+        ("Hardcodet.NotifyIcon.Wpf", "WPF 托盘图标", "Avalonia 12 内置 TrayIcon"),
+        ("System.Windows.Interactivity", "WPF 交互库", "Avalonia 事件/类行为"),
+        ("WPFToolkit", "WPF 控件库", "Avalonia 核心控件"),
+        ("FluentWPF", "WPF 控件库", "FluentTheme"),
+        ("ControlzEx", "WPF 控件基础设施", "Avalonia 内置"),
+    };
+
     private readonly ConversionOptions _options;
     private readonly List<ConversionNote> _notes = new();
     private string _file = "project.csproj";
@@ -102,6 +121,25 @@ public sealed class ProjectFileTransformer
         {
             item.Name = XName.Get("AvaloniaResource", item.Name.NamespaceName);
             Note("PROJ-RESOURCE", $"Resource → AvaloniaResource（{item.Attribute("Include")?.Value}）。");
+        }
+
+        // —— WPF-only 包隔离：避免 NETSDK1136 强制 -windows TFM，转注释待人工替换 ——
+        foreach (var item in root.Descendants()
+                     .Where(e => e.Name.LocalName == "PackageReference").ToList())
+        {
+            var id = item.Attribute("Include")?.Value?.Trim();
+            if (id == null) continue;
+            var hit = QuarantinedPackages.FirstOrDefault(q =>
+                q.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith(q.Id + ".", StringComparison.OrdinalIgnoreCase));
+            if (hit.Id == null) continue;
+
+            // XML 注释禁止含 "--"，包名仅含单连字符，此处兜底防非法输出
+            var commentText = $" {item}  已隔离：{hit.Reason}；替代方案：{hit.Replacement} ".Replace("--", "−−");
+            item.ReplaceWith(new XComment(commentText));
+            _notes.Add(new ConversionNote(_file, 0, NoteSeverity.Manual, "PROJ-WPF-PACKAGE",
+                $"PackageReference {id} 已注释隔离（{hit.Reason}，会强制 -windows TFM 阻断编译）。" +
+                $"替代方案：{hit.Replacement}。相关调用代码需人工迁移。"));
         }
 
         // WPF 反射绑定语义 → 保持反射绑定，避免转换后编译期绑定报错

@@ -309,9 +309,23 @@ public static class KnownMaps
         ["System.Windows.Threading"] = "Avalonia.Threading",
         ["System.Windows.Data"] = "Avalonia.Data",
         ["System.Windows.Markup"] = "Avalonia.Markup",
-        ["System.Windows.Documents"] = "Avalonia.Documents",
+        // Avalonia 12：Inline/Run 位于 Avalonia.Controls.Documents（无 Avalonia.Documents）
+        ["System.Windows.Documents"] = "Avalonia.Controls.Documents",
         ["System.Windows.Interactivity"] = "Avalonia.Xaml.Interactivity",
         ["Microsoft.Xaml.Behaviors.Wpf"] = "Avalonia.Xaml.Behaviors",
+    };
+
+    /// <summary>
+    /// using System.Windows 需要额外补充的命名空间：
+    /// WPF System.Windows 是大杂烩（Window/Style/Layoutable 分属不同 Avalonia 命名空间），
+    /// 单映射到 Avalonia 会丢失 Window（Avalonia.Controls）、Style（Avalonia.Styling）、
+    /// Layoutable（Avalonia.Layout）等高频类型。均经 Avalonia 12 反射验证。
+    /// </summary>
+    public static readonly IReadOnlyList<string> SystemWindowsExtraUsings = new[]
+    {
+        "Avalonia.Controls",
+        "Avalonia.Layout",
+        "Avalonia.Styling",
     };
 
     /// <summary>类型名映射（标识符形式；全限定形式单独处理）。</summary>
@@ -330,6 +344,23 @@ public static class KnownMaps
         ["PropertyMetadata"] = "global::Avalonia.StyledPropertyMetadata",
         ["UIElement"] = "global::Avalonia.Input.InputElement",
         ["VisualBrush"] = "global::Avalonia.Media.ImmutableBrush", // 近似，标记 WARN
+        // —— Avalonia 12 实测补充（程序集反射验证）——
+        // WPF FrameworkElement → Layoutable（Width/Margin/Alignment 齐全；ActualWidth→Bounds.Width、
+        // Tag/ToolTip/ContextMenu 在别处，标记 WARN）
+        ["FrameworkElement"] = "global::Avalonia.Layout.Layoutable",
+        // WPF DP 属性变更参数 → Avalonia 12 非泛型基类（OldValue/NewValue/Property 均在）
+        ["DependencyPropertyChangedEventArgs"] = "global::Avalonia.AvaloniaPropertyChangedEventArgs",
+        // TemplatePart 特性：Avalonia.Controls.Metadata.TemplatePartAttribute
+        ["TemplatePart"] = "global::Avalonia.Controls.Metadata.TemplatePartAttribute",
+        ["TemplatePartAttribute"] = "global::Avalonia.Controls.Metadata.TemplatePartAttribute",
+        // 滚动条可见性枚举位置
+        ["ScrollBarVisibility"] = "global::Avalonia.Controls.Primitives.ScrollBarVisibility",
+        // WPF ListView → Avalonia ListBox 体系
+        ["ListViewItem"] = "global::Avalonia.Controls.ListBoxItem",
+        // 窗口状态枚举位置（成员访问名不受影响）
+        ["WindowState"] = "global::Avalonia.Controls.WindowState",
+        // Avalonia 12 已移除 Visibility 枚举 → bool（IsVisible）；Hidden/Collapsed 语义合并
+        ["Visibility"] = "bool",
     };
 
     /// <summary>全限定类型映射（System.Windows.Point 等）。</summary>

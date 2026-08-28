@@ -26,13 +26,16 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private static readonly (string Prefix, string Replacement)[] QualifiedPrefixes =
     {
         ("System.Windows.Media.Imaging", "global::Avalonia.Media.Imaging"),
+        // WPF 动画命名空间 → Avalonia.Animation（不是 Avalonia.Media.Animation！）
+        ("System.Windows.Media.Animation", "global::Avalonia.Animation"),
         ("System.Windows.Controls.Primitives", "global::Avalonia.Controls.Primitives"),
         ("System.Windows.Controls.Shapes", "global::Avalonia.Controls.Shapes"),
         ("System.Windows.Controls", "global::Avalonia.Controls"),
         ("System.Windows.Threading", "global::Avalonia.Threading"),
         ("System.Windows.Shapes", "global::Avalonia.Controls.Shapes"),
         ("System.Windows.Input", "global::Avalonia.Input"),
-        ("System.Windows.Documents", "global::Avalonia.Documents"),
+        // Avalonia 12：Inline/Run 在 Avalonia.Controls.Documents
+        ("System.Windows.Documents", "global::Avalonia.Controls.Documents"),
         ("System.Windows.Data", "global::Avalonia.Data"),
         ("System.Windows.Markup", "global::Avalonia.Markup"),
         ("System.Windows.Media", "global::Avalonia.Media"),
@@ -78,9 +81,39 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
 
     // ------------------------------------------------------------------ using
 
+    private bool _sawSystemWindows;
+
+    public override SyntaxNode? VisitCompilationUnit(CompilationUnitSyntax node)
+    {
+        var visited = (CompilationUnitSyntax?)base.VisitCompilationUnit(node);
+        if (visited == null || !_sawSystemWindows || KnownMaps.SystemWindowsExtraUsings.Count == 0)
+            return visited;
+
+        // using System.Windows → using Avalonia 只覆盖基础类型；
+        // Window/Style/Layoutable 等高频类型分属其它命名空间，统一补齐（去重）
+        var existing = visited.Usings
+            .Select(u => u.Name?.ToString().Replace("global::", ""))
+            .Where(n => n != null)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var additions = KnownMaps.SystemWindowsExtraUsings
+            .Where(ns => !existing.Contains(ns))
+            .Select(ns => SyntaxFactory.UsingDirective(
+                SyntaxFactory.ParseName(ns).WithLeadingTrivia(SyntaxFactory.Space))
+                .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed))
+            .ToList();
+        if (additions.Count == 0) return visited;
+
+        Note(visited, NoteSeverity.Info, "CS-USING-EXTRA",
+            "已补充 " + string.Join("/", KnownMaps.SystemWindowsExtraUsings) +
+            "（WPF System.Windows 大杂烩命名空间中的 Window/Style/Layoutable 等分属这些 Avalonia 命名空间）。");
+        return visited.WithUsings(visited.Usings.AddRange(additions));
+    }
+
     public override SyntaxNode? VisitUsingDirective(UsingDirectiveSyntax node)
     {
         var name = node.Name?.ToString().Trim() ?? "";
+        if (name == "System.Windows") _sawSystemWindows = true;
         if (name.Length > 0 && KnownMaps.CSharpNamespaces.TryGetValue(name, out var mapped))
         {
             WpfDetected = true;
@@ -103,6 +136,24 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     public override SyntaxNode? VisitMemberAccessExpression(MemberAccessExpressionSyntax node)
     {
         var text = node.ToString();
+
+        // —— Visibility 枚举已从 Avalonia 12 移除（只剩 Visual.IsVisible bool）——
+        // 必须在限定前缀重写之前处理，否则 System.Windows.Visibility.Collapsed 会先被
+        // 前缀逻辑替换成不存在的 global::Avalonia.Visibility.Collapsed
+        if (text is "Visibility.Collapsed" or "Visibility.Hidden" or
+            "System.Windows.Visibility.Collapsed" or "System.Windows.Visibility.Hidden")
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Warning, "CS-VISIBILITY",
+                "Visibility.Collapsed/Hidden → false（Avalonia 12 移除 Visibility 枚举，IsVisible 布尔；Hidden 的占位语义丢失）。");
+            return SyntaxFactory.LiteralExpression(SyntaxKind.FalseLiteralExpression).WithTriviaFrom(node);
+        }
+        if (text is "Visibility.Visible" or "System.Windows.Visibility.Visible")
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-VISIBILITY", "Visibility.Visible → true（Avalonia 12：IsVisible 布尔）。");
+            return SyntaxFactory.LiteralExpression(SyntaxKind.TrueLiteralExpression).WithTriviaFrom(node);
+        }
 
         // 全限定前缀重写（System.Windows.Media.Brushes.Red 等）
         foreach (var (prefix, replacement) in QualifiedPrefixes)
@@ -167,6 +218,15 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return node.WithName(newName);
         }
 
+        // x.Visibility 成员访问 → x.IsVisible（bool；枚举字面量已在上方统一转 true/false）
+        if (node.Name.Identifier.ValueText == "Visibility")
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Warning, "CS-VISIBILITY",
+                "xxx.Visibility → xxx.IsVisible（bool）。比较/赋值右侧的 Visibility.* 已转布尔字面量。");
+            return node.WithName(SyntaxFactory.IdentifierName("IsVisible").WithTriviaFrom(node.Name));
+        }
+
         ManualNote(node, text);
         return base.VisitMemberAccessExpression(node);
     }
@@ -182,12 +242,28 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return base.VisitIdentifierName(node);
         if (node.Parent is NameColonSyntax or NameEqualsSyntax)
             return base.VisitIdentifierName(node);
+        // x?.Member（MemberBinding.Name 位置必须是 SimpleNameSyntax）：
+        // 成员名与类型名同名时（如 lhs?.ImageSource）不能替换为限定名，否则 InvalidCastException
+        if (node.Parent is MemberBindingExpressionSyntax mbe && ReferenceEquals(mbe.Name, node))
+            return base.VisitIdentifierName(node);
+        // global::X（AliasQualifiedName.Name 同样要求 SimpleNameSyntax）
+        if (node.Parent is AliasQualifiedNameSyntax aqn && ReferenceEquals(aqn.Name, node))
+            return base.VisitIdentifierName(node);
 
         var name = node.Identifier.ValueText;
         if (KnownMaps.TypeRenames.TryGetValue(name, out var mapped))
         {
             WpfDetected = true;
-            var severity = name is "VisualBrush" or "BitmapSource" ? NoteSeverity.Warning : NoteSeverity.Info;
+            // 关键字类型（Visibility → bool）不能经 ParseName（非标识符）
+            if (mapped == "bool")
+            {
+                Note(node, NoteSeverity.Warning, "CS-VISIBILITY-TYPE",
+                    "Visibility 类型 → bool（Avalonia 12 移除枚举；值域 0/1/2 合并为 true/false）。");
+                return SyntaxFactory.PredefinedType(
+                    SyntaxFactory.Token(SyntaxKind.BoolKeyword)).WithTriviaFrom(node);
+            }
+            var severity = name is "VisualBrush" or "BitmapSource" or "FrameworkElement"
+                ? NoteSeverity.Warning : NoteSeverity.Info;
             Note(node, severity, "CS-TYPE-RENAME", $"类型 {name} → {mapped}");
             return SyntaxFactory.ParseName(mapped).WithTriviaFrom(node);
         }

@@ -102,4 +102,42 @@ public class ProjectFileTransformerTests
         // 沿用源工程设置，避免 WPF 旧式签名产生可空警告噪音
         Assert.DoesNotContain("<Nullable>", r.Xml);
     }
+
+    [Fact]
+    public void WpfOnlyPackages_AreQuarantinedAsComments()
+    {
+        // Microsoft-WindowsAPICodePack-Shell 真实构建触发 NETSDK1136（强制 -windows TFM）
+        var xml = """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net8.0-windows</TargetFramework>
+                <UseWPF>true</UseWPF>
+              </PropertyGroup>
+              <ItemGroup>
+                <PackageReference Include="Microsoft-WindowsAPICodePack-Shell" Version="1.1.5" />
+                <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+                <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
+              </ItemGroup>
+            </Project>
+            """;
+
+        var r = Transform(xml);
+
+        // WPF-only 包转为注释（保留原行文本），非 WPF 包原样保留
+        Assert.DoesNotContain("Include=\"Microsoft-WindowsAPICodePack-Shell\"", ExtractElements(r.Xml));
+        Assert.DoesNotContain("Include=\"Hardcodet.NotifyIcon.Wpf\"", ExtractElements(r.Xml));
+        Assert.Contains("已隔离", r.Xml);
+        Assert.Contains("Newtonsoft.Json", ExtractElements(r.Xml));
+
+        // 输出仍是合法 XML
+        var doc = XDocument.Parse(r.Xml);
+        Assert.NotNull(doc.Root);
+
+        // 生成 Manual 级 TODO
+        Assert.Contains(r.Notes, n => n.Rule == "PROJ-WPF-PACKAGE" && n.Severity == NoteSeverity.Manual);
+    }
+
+    private static string ExtractElements(string xml) =>
+        string.Join("\n", XDocument.Parse(xml).Descendants("PackageReference")
+            .Select(p => p.Attribute("Include")?.Value ?? ""));
 }

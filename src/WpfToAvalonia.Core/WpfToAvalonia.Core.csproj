@@ -10,4 +10,8 @@
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="5.9.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="WpfToAvalonia.Tests" />
+  </ItemGroup>
+
 </Project>
