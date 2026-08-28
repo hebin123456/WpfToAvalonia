@@ -116,13 +116,18 @@ public sealed class ProjectConverter
             .Where(p => !IsUnderObjBin(p))
             .ToList();
 
+        // BCL 包补偿探测：去 WindowsDesktop 框架后传递断供的程序集（csproj 侧注入）
+        var frameworkPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var cs in csFiles.Where(p => p != appCs))
         {
             var rel = Path.GetRelativePath(dir, cs);
+            var csSource = File.ReadAllText(cs);
+            DetectFrameworkPackages(csSource, frameworkPackages);
             CSharpTransformResult result;
             try
             {
-                result = csharp.Transform(File.ReadAllText(cs), rel);
+                result = csharp.Transform(csSource, rel);
             }
             catch (Exception ex)
             {
@@ -133,7 +138,6 @@ public sealed class ProjectConverter
             if (!result.WpfDetected) continue;
 
             _report.AddRange(result.Notes);
-            var csSource = File.ReadAllText(cs);
             if (!_options.DryRun && result.Code != csSource)
             {
                 File.WriteAllText(cs, result.Code);
@@ -160,7 +164,8 @@ public sealed class ProjectConverter
 
         // ---------- 4. csproj ----------
         var projTransformer = new ProjectFileTransformer(_options);
-        var projResult = projTransformer.Transform(csprojText, Path.GetFileName(csprojPath), usesDataGrid);
+        var projResult = projTransformer.Transform(csprojText, Path.GetFileName(csprojPath), usesDataGrid,
+            frameworkPackages);
         _report.AddRange(projResult.Notes);
         if (!_options.DryRun)
         {
@@ -305,6 +310,27 @@ public sealed class ProjectConverter
         return rootNs.Length > 0
             ? $"{rootNs}.{Path.GetFileNameWithoutExtension(startupUri)}"
             : Path.GetFileNameWithoutExtension(startupUri);
+    }
+
+    /// <summary>
+    /// BCL 包补偿探测：WindowsDesktop 桌面框架（UseWPF）被移除后，其传递提供的程序集
+    /// 断供——System.Drawing.Common（Icon/Bitmap/Graphics 重型类型；Color/Point 等
+    /// 原语在 System.Drawing.Primitives 属共享框架、无需包）、System.CodeDom
+    ///（TempFileCollection）。检测结果传入 csproj 转换器注入显式包引用
+    ///（ForkPlus 端到端 CS1069 实测：IconTools.cs / TempFileManager.cs）。
+    /// </summary>
+    private static void DetectFrameworkPackages(string source, HashSet<string> packages)
+    {
+        if (source.Contains("using System.Drawing;", StringComparison.Ordinal) &&
+            Regex.IsMatch(source, @"\b(Icon|Bitmap|Graphics)\b"))
+        {
+            packages.Add("System.Drawing.Common");
+        }
+        if (source.Contains("using System.CodeDom.Compiler;", StringComparison.Ordinal) ||
+            source.Contains("System.CodeDom.Compiler.", StringComparison.Ordinal))
+        {
+            packages.Add("System.CodeDom");
+        }
     }
 
     private static bool IsUnderObjBin(string path) =>

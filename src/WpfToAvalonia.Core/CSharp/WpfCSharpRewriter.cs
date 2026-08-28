@@ -191,6 +191,27 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return base.VisitMemberAccessExpression(node);
         }
 
+        // —— WPF 独有类型（成员访问限定形式）：保留原样，不落入前缀重写 ——
+        // System.Windows.Data.ListCollectionView.X 静态成员访问：前缀重写会产出
+        // 不存在的 Avalonia.Data.ListCollectionView.X（与 RewriteQualified 的
+        // 同名守卫配对；类型级替代方案见 WpfOnlyTypes）。
+        foreach (var (prefix, _) in QualifiedPrefixes)
+        {
+            if (!text.StartsWith(prefix + ".", StringComparison.Ordinal)) continue;
+            // 最长命中前缀（列表按长度降序）后的第一个 segment 是类型名
+            var rest = text[(prefix.Length + 1)..];
+            var next = rest.Contains('.') ? rest[..rest.IndexOf('.')] : rest;
+            if (KnownMaps.WpfOnlyTypes.ContainsKey(next))
+            {
+                WpfDetected = true;
+                if (_dedupe.Add("WPFTYPE:" + next))
+                    Note(node, NoteSeverity.Manual, "CS-WPFONLY-TYPE",
+                        $"类型 {next}：{KnownMaps.WpfOnlyTypes[next]}（限定引用保留原样）");
+                return base.VisitMemberAccessExpression(node);
+            }
+            break;
+        }
+
         // 全限定前缀重写（System.Windows.Media.Brushes.Red 等）
         foreach (var (prefix, replacement) in QualifiedPrefixes)
         {
@@ -734,7 +755,10 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             Note(node, NoteSeverity.Manual, "CS-DEPPROP", "属性类型参数非 typeof(...)，需人工转换。");
             return base.VisitFieldDeclaration(node);
         }
-        var valueType = typeofValue.Type.ToString();
+        // typeof 实参先经本重写器访问再取文本：裸名走 TypeRenames（ImageSource→IImage、
+        // FrameworkElement→Control）、限定名走精确全名/前缀替换、泛型实参递归下降
+        //（ForkPlus PlaceholderTextBox CS0246 实测：原始文本直拼曾漏掉值类型改名）。
+        var valueType = VisitTypeSyntaxText(typeofValue.Type);
 
         // 默认值（仅当元数据是 new *PropertyMetadata(字面量) 形式）
         string defaultArg = "";
@@ -784,6 +808,18 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return base.VisitFieldDeclaration(node);
         }
         return parsed.WithTriviaFrom(node);
+    }
+
+    /// <summary>
+    /// DP 注册的 typeof 值类型改名为最终文本：经 Visit 分发到 VisitIdentifierName
+    ///（TypeRenames：ImageSource→IImage、Visibility→bool）、VisitQualifiedName
+    ///（精确全名/前缀替换）与默认泛型实参下降，保证拼入
+    /// StyledProperty&lt;V&gt;/Register&lt;T, V&gt; 模板的类型已是 Avalonia 名。
+    /// </summary>
+    private string VisitTypeSyntaxText(TypeSyntax type)
+    {
+        var visited = Visit(type);
+        return (visited ?? type).ToString();
     }
 
     // ------------------------------------------------------------------ 其它
@@ -1208,6 +1244,20 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             changed = true;
             Note(node, NoteSeverity.Info, "CS-QUALIFIED-EXACT", $"{text} → {exact}（精确全名映射，跨命名空间移动的类型）。");
             return SyntaxFactory.ParseName(exact);
+        }
+        // —— WPF 独有类型（限定名形式）：整名保留 + 人工提示，不下降子节点 ——
+        // 否则前缀替换产出不存在的 Avalonia.Data.ListCollectionView（ForkPlus CS0234
+        // 实测）；保留原名让 CS0246 与 WpfOnlyTypes 的替代方案指引一一对应。
+        // 仅 WPF 前缀限定名命中（用户自有类型不受影响）。
+        if (KnownMaps.WpfOnlyTypes.ContainsKey(node.Right.Identifier.ValueText) &&
+            QualifiedPrefixes.Any(p => text.StartsWith(p.Prefix + ".", StringComparison.Ordinal)))
+        {
+            WpfDetected = true;
+            changed = true; // 走 rewritten 分支返回原 node（阻止左部前缀重写）
+            if (_dedupe.Add("WPFTYPE:" + node.Right.Identifier.ValueText))
+                Note(node, NoteSeverity.Manual, "CS-WPFONLY-TYPE",
+                    $"类型 {node.Right.Identifier.ValueText}：{KnownMaps.WpfOnlyTypes[node.Right.Identifier.ValueText]}（限定名保留原样）");
+            return node;
         }
         foreach (var (prefix, replacement) in QualifiedPrefixes)
         {

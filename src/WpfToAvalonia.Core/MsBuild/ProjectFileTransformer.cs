@@ -52,13 +52,28 @@ public sealed class ProjectFileTransformer
             "API 高度兼容（TextEditor/TextArea/Margin 体系同名），DrawingContext API 差异见转换报告提示。"),
     };
 
+    /// <summary>
+    /// 代码用法驱动的 BCL 包补偿（ProjectConverter 探测传入）：去 WindowsDesktop 框架
+    /// （UseWPF 移除）后，桌面共享框架传递提供的程序集断供——
+    /// System.Drawing.Common（Icon/Bitmap/Graphics，ForkPlus IconTools.cs CS1069 实测）、
+    /// System.CodeDom（TempFileCollection，TempFileManager.cs CS1069 实测）。
+    /// 10.0.0 版本均经 NuGet 真实 restore 验证（net10.0）。
+    /// </summary>
+    private static readonly Dictionary<string, string> FrameworkPackageVersions =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["System.Drawing.Common"] = "10.0.0",
+            ["System.CodeDom"] = "10.0.0",
+        };
+
     private readonly ConversionOptions _options;
     private readonly List<ConversionNote> _notes = new();
     private string _file = "project.csproj";
 
     public ProjectFileTransformer(ConversionOptions options) => _options = options;
 
-    public ProjectFileResult Transform(string csprojXml, string fileName, bool usesDataGrid)
+    public ProjectFileResult Transform(string csprojXml, string fileName, bool usesDataGrid,
+        IReadOnlySet<string>? frameworkPackages = null)
     {
         _notes.Clear();
         _file = fileName;
@@ -196,6 +211,28 @@ public sealed class ProjectFileTransformer
         };
         if (usesDataGrid) pkgs.Add(("Avalonia.Controls.DataGrid", _options.AvaloniaVersion));
         if (_options.AddInterFont) pkgs.Add(("Avalonia.Fonts.Inter", _options.AvaloniaVersion));
+
+        // —— BCL 包补偿（去 WindowsDesktop 框架断供）：仅在既有引用缺失时注入 ——
+        if (frameworkPackages is { Count: > 0 })
+        {
+            var existingIds = root.Descendants()
+                .Where(e => e.Name.LocalName == "PackageReference")
+                .Select(e => e.Attribute("Include")?.Value?.Trim())
+                .Where(id => id is not null)
+                .Cast<string>()
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var id in frameworkPackages)
+            {
+                if (!FrameworkPackageVersions.TryGetValue(id, out var ver)) continue;
+                if (existingIds.Contains(id)) continue;
+                pkgs.Add((id, ver));
+                _notes.Add(new ConversionNote(_file, 0, NoteSeverity.Warning, "PROJ-FX-PACKAGE",
+                    $"已添加 PackageReference {id} {ver}（代码使用相关类型；原由 WindowsDesktop 桌面框架传递提供，去 WPF 化后断供）。"
+                    + (id.Equals("System.Drawing.Common", StringComparison.OrdinalIgnoreCase)
+                        ? "注意：System.Drawing.Common 仅 Windows 运行时可用，跨平台部署需换 ImageSharp/SkiaSharp。"
+                        : "")));
+            }
+        }
 
         var itemGroup = new XElement("ItemGroup");
         foreach (var (id, ver) in pkgs)

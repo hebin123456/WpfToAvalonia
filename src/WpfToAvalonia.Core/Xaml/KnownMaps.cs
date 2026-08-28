@@ -423,9 +423,11 @@ public static class KnownMaps
         ["UIElement"] = "global::Avalonia.Input.InputElement",
         ["VisualBrush"] = "global::Avalonia.Media.ImmutableBrush", // 近似，标记 WARN
         // —— Avalonia 12 实测补充（程序集反射验证）——
-        // WPF FrameworkElement → Layoutable（Width/Margin/Alignment 齐全；ActualWidth→Bounds.Width、
-        // Tag/ToolTip/ContextMenu 在别处，标记 WARN）
-        ["FrameworkElement"] = "global::Avalonia.Layout.Layoutable",
+        // WPF FrameworkElement → Control（ForkPlus Treemap CS0115 驱动：Layoutable 不在
+        // InputElement 继承链上，无 OnPointerXxx/OnSizeChanged 虚方法；Control 继承链
+        // Control→InputElement→Interactive→Layoutable 全覆盖：布局+输入+渲染。反射验证）。
+        // ActualWidth→Bounds.Width；Tag/ToolTip/ContextMenu 差异标 WARN。
+        ["FrameworkElement"] = "global::Avalonia.Controls.Control",
         // WPF DP 属性变更参数 → Avalonia 12 非泛型基类（OldValue/NewValue/Property 均在）
         ["DependencyPropertyChangedEventArgs"] = "global::Avalonia.AvaloniaPropertyChangedEventArgs",
         // TemplatePart 特性：Avalonia.Controls.Metadata.TemplatePartAttribute
@@ -433,6 +435,15 @@ public static class KnownMaps
         ["TemplatePartAttribute"] = "global::Avalonia.Controls.Metadata.TemplatePartAttribute",
         // 滚动条可见性枚举位置
         ["ScrollBarVisibility"] = "global::Avalonia.Controls.Primitives.ScrollBarVisibility",
+        // —— 反射验证（Avalonia 12）——
+        // ICommand：Avalonia 无自有接口，Button.Command 属性类型就是 BCL 的
+        // System.Windows.Input.ICommand（System.ObjectModel 程序集，全平台可用）。
+        // 全限定映射保证 using Avalonia.Input（无 ICommand）下仍可解析。
+        ["ICommand"] = "global::System.Windows.Input.ICommand",
+        // IDataObject（拖拽数据）：Avalonia 12 无接口，等价是 Avalonia.Input.IDataTransfer
+        //（DragEventArgs.DataTransfer / DragDrop.DoDragDropAsync 参数；DataObject 已过时）。
+        // 方法体 SetData/GetData 成员差异由 CS-DRAGDROP 人工提示覆盖。
+        ["IDataObject"] = "global::Avalonia.Input.IDataTransfer",
         // WPF ListView → Avalonia ListBox 体系
         ["ListViewItem"] = "global::Avalonia.Controls.ListBoxItem",
         // ListView 本体（代码侧 new ListView()/类型声明）
@@ -606,6 +617,12 @@ public static class KnownMaps
         ["ResizeMode"] = "WPF ResizeMode 枚举无等价：Window.CanResize bool（NoResize/CanMinimize→false，CanResize*→true；grip 无等价）。",
         ["RoutedPropertyChangedEventArgs"] = "WPF 值变更路由参数无等价：ValueChanged/PropertyChange 事件参数（T 类型的旧/新值属性各异）。",
         ["CommonFileDialog"] = "WindowsAPICodePack 对话框已随包隔离：改用 Avalonia StorageProvider（IStorageProvider.OpenFilePickerAsync 等）。",
+        // —— WPF 集合视图族（ForkPlus StatisticsUserControl CS0234 实测：前缀替换曾产出
+        //    不存在的 Avalonia.Data.ListCollectionView；Avalonia 无 CollectionView 概念）——
+        ["ListCollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable/DataView 不存在；排序/过滤/分组在 ViewModel 层实现（ListCollectionView.SortDescriptions/Filter → 预处理集合或自建包装）。",
+        ["CollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable；排序/过滤在 ViewModel 层实现。",
+        ["ICollectionView"] = "WPF 集合视图接口无等价：Avalonia 直接绑定 IEnumerable；排序/过滤在 ViewModel 层实现。",
+        ["BindingListCollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable；分组/过滤在 ViewModel 层实现。",
     };
 
     /// <summary>全限定类型映射（System.Windows.Point 等）。
@@ -635,6 +652,11 @@ public static class KnownMaps
         // —— 跨命名空间移动的基类/扩展点（前缀替换会得到不存在的类型）——
         ["System.Windows.Markup.MarkupExtension"] = "global::Avalonia.Markup.Xaml.MarkupExtension",
         ["System.Windows.Markup.IComponentConnector"] = "global::Avalonia.Markup.Xaml.IComponentConnector",
+        // WPF FrameworkElement 基类（前缀替换 → Avalonia.FrameworkElement 不存在；与裸名
+        // TypeRenames["FrameworkElement"] 对齐：Control 继承链覆盖布局+输入+渲染）
+        ["System.Windows.FrameworkElement"] = "global::Avalonia.Controls.Control",
+        // WPF UIElement 基类（前缀替换 → Avalonia.UIElement 不存在；InputElement 是输入层）
+        ["System.Windows.UIElement"] = "global::Avalonia.Input.InputElement",
         ["System.Windows.Media.Imaging.BitmapImage"] = "global::Avalonia.Media.Imaging.Bitmap",
         ["System.Windows.Media.Imaging.BitmapSource"] = "global::Avalonia.Media.Imaging.Bitmap",
         ["System.Windows.Controls.ContextMenuEventArgs"] = "global::Avalonia.Input.ContextRequestedEventArgs",
