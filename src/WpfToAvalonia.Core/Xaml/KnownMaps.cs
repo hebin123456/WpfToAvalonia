@@ -392,6 +392,87 @@ public static class KnownMaps
         ["Visibility"] = "bool",
     };
 
+    /// <summary>虚方法覆盖重写映射（WPF 覆盖虚方法 → Avalonia 12 虚方法）。</summary>
+    public sealed record OverrideMethodMap(string NewName, string? Param0Type);
+
+    /// <summary>
+    /// WPF 覆盖虚方法 → Avalonia 12 虚方法（方法名/参数 0 类型强制覆盖）。
+    /// 全部经 Avalonia 12.1.1 程序集反射验证：InputElement（指针/键盘）、
+    /// Visual（Render public）、Control（OnSizeChanged）、TemplatedControl、Window。
+    /// Param0Type 为 null 表示保留原参数类型（已由 TypeRenames 处理）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, OverrideMethodMap> OverrideMethodRenames =
+        new Dictionary<string, OverrideMethodMap>
+        {
+            // 键盘（InputElement）
+            ["OnPreviewKeyDown"] = new("OnKeyDown", null),
+            ["OnPreviewKeyUp"] = new("OnKeyUp", null),
+            // 指针（InputElement）：WPF 鼠标虚方法族 → OnPointerXxx
+            ["OnMouseDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnPreviewMouseDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnMouseUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            ["OnPreviewMouseUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            ["OnMouseLeftButtonDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnPreviewMouseLeftButtonDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnMouseLeftButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            ["OnPreviewMouseLeftButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            ["OnMouseRightButtonDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnMouseRightButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            ["OnMouseMove"] = new("OnPointerMoved", "global::Avalonia.Input.PointerEventArgs"),
+            ["OnPreviewMouseMove"] = new("OnPointerMoved", "global::Avalonia.Input.PointerEventArgs"),
+            ["OnMouseEnter"] = new("OnPointerEntered", "global::Avalonia.Input.PointerEventArgs"),
+            ["OnMouseLeave"] = new("OnPointerExited", "global::Avalonia.Input.PointerEventArgs"),
+            ["OnMouseWheel"] = new("OnPointerWheelChanged", "global::Avalonia.Input.PointerWheelEventArgs"),
+            ["OnPreviewMouseWheel"] = new("OnPointerWheelChanged", "global::Avalonia.Input.PointerWheelEventArgs"),
+            ["OnMouseDoubleClick"] = new("OnDoubleTapped", "global::Avalonia.Input.TappedEventArgs"),
+            ["OnPreviewMouseDoubleClick"] = new("OnDoubleTapped", "global::Avalonia.Input.TappedEventArgs"),
+            // 自绘：WPF protected OnRender(DrawingContext) → Avalonia public Render(DrawingContext)
+            ["OnRender"] = new("Render", null),
+            // 尺寸：WPF OnRenderSizeChanged(SizeChangedInfo) → Control.OnSizeChanged(SizeChangedEventArgs)
+            ["OnRenderSizeChanged"] = new("OnSizeChanged", "global::Avalonia.Controls.SizeChangedEventArgs"),
+            // 父级变化：WPF 参数 DependencyObject×2 → Visual×2
+            ["OnVisualParentChanged"] = new("OnVisualParentChanged", "global::Avalonia.Visual"),
+            // Window 关闭：WPF OnClosing(CancelEventArgs) → Window.OnClosing(WindowClosingEventArgs)
+            ["OnClosing"] = new("OnClosing", "global::Avalonia.Controls.WindowClosingEventArgs"),
+        };
+
+    /// <summary>
+    /// WPF 覆盖虚方法在 Avalonia 12 中无对应覆盖点：不改签名，输出人工提示
+    /// （反射验证后确认缺席的虚方法）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> OverrideMethodManualNotes =
+        new Dictionary<string, string>
+        {
+            ["OnDrop"] = "拖拽虚方法无覆盖点：AddHandler(DragDrop.DropEvent, H, RoutingStrategies.Bubble) 订阅。",
+            ["OnDragEnter"] = "拖拽虚方法无覆盖点：AddHandler(DragDrop.DragEnterEvent, H, RoutingStrategies.Bubble) 订阅。",
+            ["OnDragLeave"] = "拖拽虚方法无覆盖点：AddHandler(DragDrop.DragLeaveEvent, H, RoutingStrategies.Bubble) 订阅。",
+            ["OnDragOver"] = "拖拽虚方法无覆盖点：AddHandler(DragDrop.DragOverEvent, H, RoutingStrategies.Bubble) 订阅。",
+            ["OnGiveFeedback"] = "拖拽反馈无等价（Avalonia 拖拽光标自管理）。",
+            ["OnQueryContinueDrag"] = "拖拽续行查询无等价。",
+            ["OnLocationChanged"] = "Window 位置变化无虚方法：构造函数订阅 PositionChanged 事件。",
+            ["OnActivated"] = "Window 激活无虚方法：订阅 Activated 事件。",
+            ["OnDeactivated"] = "Window 失活无虚方法：订阅 Deactivated 事件。",
+            ["OnSourceInitialized"] = "无等价（WPF HWND 初始化回调）：改用 OnOpened 或 TopLevel 平台句柄 API（TryGetPlatformHandle）。",
+            ["OnContentRendered"] = "无等价：改用 OnOpened / LayoutUpdated。",
+            ["OnSelectionChanged"] = "SelectingItemsControl 无此虚方法：订阅 SelectionChanged 事件（或 SelectionModel 变更回调）。",
+            ["OnTextChanged"] = "TextBox 无 OnTextChanged 虚方法：订阅 TextChanged 事件。",
+            ["GetContainerForItemOverride"] = "ItemsControl 容器机制不同：CreateContainerForItemOverride(object item, int index, object recycleKey)。",
+            ["IsItemItsOwnContainerOverride"] = "ItemsControl 容器机制不同：NeedsContainerOverride(object item, int index, out object recycleKey)。",
+            ["OnStartup"] = "Application 无 OnStartup：Avalonia 用 OnFrameworkInitializationCompleted（AppBuilder 生命周期）。",
+            ["OnExit"] = "Application 无 OnExit：订阅 lifetime.Exit 事件（IClassicDesktopStyleApplicationLifetime）。",
+            ["OnSessionEnding"] = "无等价：订阅 lifetime.Exit / 系统会话事件自行处理。",
+        };
+
+    /// <summary>WPF 独有命名空间（Avalonia 无等价）：using 移除 / 限定引用保留并提示人工。</summary>
+    public static readonly IReadOnlySet<string> WpfOnlyNamespaces = new HashSet<string>
+    {
+        "System.Windows.Navigation",
+        "System.Windows.Interop",
+        "System.Windows.Media.Media3D",
+        "System.Windows.Shell",
+        "System.Windows.Resources",
+    };
+
     /// <summary>全限定类型映射（System.Windows.Point 等）。</summary>
     public static readonly IReadOnlyDictionary<string, string> QualifiedTypeRenames = new Dictionary<string, string>
     {

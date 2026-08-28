@@ -190,4 +190,102 @@ public class CSharpTransformerTests
 
         Assert.Contains(r.Notes, n => n.Severity == NoteSeverity.Manual);
     }
+
+    [Fact]
+    public void VisibilityAssignment_LhsBecomes_IsVisible_NotBool()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : Button
+                {
+                    void M()
+                    {
+                        Visibility = Visibility.Collapsed;
+                    }
+                }
+            }
+            """);
+
+        // 左侧是属性名（this.Visibility）→ IsVisible；右侧枚举成员 → false 字面量
+        Assert.Contains("IsVisible = false", r.Code);
+        Assert.DoesNotContain("bool = false", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-VISIBILITY-PROP");
+    }
+
+    [Fact]
+    public void VisibilityObjectInitializer_LhsBecomes_IsVisible()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C
+                {
+                    void M()
+                    {
+                        var b = new TextBlock { Text = "x", Visibility = Visibility.Collapsed };
+                    }
+                }
+            }
+            """);
+
+        // 对象初始化器里的 A = v 是 SimpleAssignmentExpression（非 NameEquals）：
+        // 左侧须映射属性名 IsVisible，按类型映射 bool 会产出 `bool = false` 语法错误
+        Assert.Contains("IsVisible = false", r.Code);
+        Assert.DoesNotContain("bool = false", r.Code);
+    }
+
+    [Fact]
+    public void VisibilityTypePosition_StillBecomes_Bool()
+    {
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class C
+                {
+                    void M()
+                    {
+                        Visibility v = Visibility.Visible;
+                        var w = (Visibility)1;
+                        var t = typeof(Visibility);
+                    }
+                }
+            }
+            """);
+
+        // 类型位置（局部声明 / cast / typeof）→ bool 映射保持不变
+        Assert.Contains("bool v = true", r.Code);
+        Assert.Contains("(bool)1", r.Code);
+        Assert.Contains("typeof(bool)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-VISIBILITY-TYPE");
+    }
+
+    [Fact]
+    public void BareVisibilityComparison_Becomes_IsVisible()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : UserControl
+                {
+                    bool M() => Visibility == Visibility.Visible;
+                }
+            }
+            """);
+
+        // 裸标识符比较（this.Visibility == …）→ IsVisible == true
+        Assert.Contains("IsVisible == true", r.Code);
+        Assert.DoesNotContain("bool == true", r.Code);
+    }
 }

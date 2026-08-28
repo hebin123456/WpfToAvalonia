@@ -264,6 +264,21 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             return SyntaxFactory.ParseName("global::Avalonia.Input.TappedEventArgs").WithTriviaFrom(node);
         }
 
+        // —— Visibility 表达式位置 = 属性引用（this.Visibility → IsVisible）——
+        // 对象初始化器/简单赋值 `Visibility = v` 在 Roslyn 中是 SimpleAssignmentExpression
+        // （不是 NameEquals！NameEquals 仅用于 attribute/using 别名/属性模式），
+        // 左侧标识符是属性名 → IsVisible；裸标识符比较/传参/nameof 同理。
+        // 若按类型映射成 bool 会产出 `bool = false` 语法错误（CS1525）。
+        // 仅类型位置（声明/cast/typeof/泛型实参）才走下方 TypeRenames → bool。
+        if (name == "Visibility" && !IsTypePosition(node))
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-VISIBILITY-PROP",
+                "属性引用 Visibility → IsVisible（WPF Visibility 属性 → Avalonia Visual.IsVisible bool；"
+                + "右侧枚举值 Visibility.* 已由成员访问规则转 true/false）。");
+            return SyntaxFactory.IdentifierName("IsVisible").WithTriviaFrom(node);
+        }
+
         if (KnownMaps.TypeRenames.TryGetValue(name, out var mapped))
         {
             WpfDetected = true;
@@ -692,6 +707,31 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         _methodNames.Count > 0 &&
         KnownMaps.DoubleTappedArgMethodHints.Any(h =>
             _methodNames.Peek().Contains(h, StringComparison.Ordinal));
+
+    /// <summary>
+    /// 判断 IdentifierName 是否处于类型位置（声明类型 / cast / typeof / as / is /
+    /// 泛型实参 / 返回类型等）。仅类型位置的 Visibility 才映射 bool；
+    /// 表达式位置（赋值左侧、比较、传参）是属性引用，须映射 IsVisible。
+    /// </summary>
+    private static bool IsTypePosition(SyntaxNode node) => node.Parent switch
+    {
+        VariableDeclarationSyntax v => ReferenceEquals(v.Type, node),
+        ParameterSyntax p => ReferenceEquals(p.Type, node),
+        CastExpressionSyntax c => ReferenceEquals(c.Type, node),
+        TypeOfExpressionSyntax t => ReferenceEquals(t.Type, node),
+        ObjectCreationExpressionSyntax o => ReferenceEquals(o.Type, node),
+        DefaultExpressionSyntax d => ReferenceEquals(d.Type, node),
+        ArrayTypeSyntax a => ReferenceEquals(a.ElementType, node),
+        NullableTypeSyntax n => ReferenceEquals(n.ElementType, node),
+        MethodDeclarationSyntax m => ReferenceEquals(m.ReturnType, node),
+        PropertyDeclarationSyntax p => ReferenceEquals(p.Type, node),
+        IndexerDeclarationSyntax i => ReferenceEquals(i.Type, node),
+        SimpleBaseTypeSyntax b => ReferenceEquals(b.Type, node),
+        TypeArgumentListSyntax => true,
+        BinaryExpressionSyntax { RawKind: (int)SyntaxKind.AsExpression or (int)SyntaxKind.IsExpression } bin
+            => !ReferenceEquals(bin.Left, node),
+        _ => false,
+    };
 
     private static ExpressionSyntax Expr(SyntaxNode from, string code) =>
         SyntaxFactory.ParseExpression(code).WithTriviaFrom(from);
