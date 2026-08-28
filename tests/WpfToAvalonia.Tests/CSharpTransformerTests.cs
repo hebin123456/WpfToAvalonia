@@ -288,4 +288,221 @@ public class CSharpTransformerTests
         Assert.Contains("IsVisible == true", r.Code);
         Assert.DoesNotContain("bool == true", r.Code);
     }
+
+    // ---------------------------------------------- 虚方法覆盖重写（CS-OVERRIDE-*）
+
+    [Fact]
+    public void OnMouseDownOverride_RenamedTo_OnPointerPressed_WithBaseSync()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Controls;
+            using System.Windows.Input;
+
+            namespace Demo
+            {
+                class C : ListBox
+                {
+                    protected override void OnMouseDown(MouseButtonEventArgs e)
+                    {
+                        base.OnMouseDown(e);
+                        var pos = e.GetPosition(this);
+                    }
+                }
+            }
+            """);
+
+        // 方法名 + 参数类型（映射表强制覆盖）
+        Assert.Contains("protected override void OnPointerPressed(global::Avalonia.Input.PointerPressedEventArgs e)", r.Code);
+        // 方法体内 base 调用同步重命名（否则 CS0115）
+        Assert.Contains("base.OnPointerPressed(e)", r.Code);
+        Assert.DoesNotContain("OnMouseDown", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-RENAME");
+    }
+
+    [Fact]
+    public void OnRenderOverride_Becomes_PublicRender()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+            using System.Windows.Media;
+
+            namespace Demo
+            {
+                class C : Control
+                {
+                    protected override void OnRender(DrawingContext dc)
+                    {
+                        base.OnRender(dc);
+                    }
+                }
+            }
+            """);
+
+        // WPF protected OnRender → Avalonia public Render（CS0507：protected 覆盖 public 报错）
+        Assert.Contains("public override void Render(DrawingContext dc)", r.Code);
+        Assert.Contains("base.Render(dc)", r.Code);
+        Assert.DoesNotContain("OnRender", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-ONRENDER-BODY");
+    }
+
+    [Fact]
+    public void OnApplyTemplate_GetsParam_AndProtected_AndBaseArg()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : TextBox
+                {
+                    public override void OnApplyTemplate()
+                    {
+                        base.OnApplyTemplate();
+                        var part = this.GetTemplateChild("PART_X");
+                    }
+                }
+            }
+            """);
+
+        // WPF 无参 public → Avalonia 12 带参 protected（CS0115：无参覆盖报错）
+        Assert.Contains("protected override void OnApplyTemplate(global::Avalonia.Controls.Primitives.TemplateAppliedEventArgs e)", r.Code);
+        // base 调用同步补 (e)
+        Assert.Contains("base.OnApplyTemplate(e)", r.Code);
+        Assert.DoesNotContain("base.OnApplyTemplate()", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-APPLYTEMPLATE");
+    }
+
+    [Fact]
+    public void OverrideClash_PreviewPlusBubble_BothKeepOriginalNames()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+            using System.Windows.Input;
+
+            namespace Demo
+            {
+                class C : TextBox
+                {
+                    protected override void OnPreviewKeyDown(KeyEventArgs e) { }
+                    protected override void OnKeyDown(KeyEventArgs e) { }
+                }
+            }
+            """);
+
+        // OnPreviewKeyDown+OnKeyDown 均得 OnKeyDown → CS0111：保留原名 + 人工合并提示
+        Assert.Contains("OnPreviewKeyDown(KeyEventArgs e)", r.Code);
+        Assert.Contains("OnKeyDown(KeyEventArgs e)", r.Code);
+        Assert.DoesNotContain("CS-OVERRIDE-RENAME", string.Join(",", r.Notes.Select(n => n.Rule)));
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-CLASH");
+    }
+
+    [Fact]
+    public void NonOverrideMethod_WithVirtualName_IsNotRenamed()
+    {
+        var r = Transform("""
+            using System.Windows.Input;
+
+            namespace Demo
+            {
+                class C
+                {
+                    private void OnMouseDown(object sender, MouseButtonEventArgs e) { }
+                }
+            }
+            """);
+
+        // 无 override 修饰的普通方法（事件处理器）不参与虚方法重命名
+        Assert.Contains("void OnMouseDown(", r.Code);
+        Assert.DoesNotContain("OnPointerPressed", r.Code);
+    }
+
+    [Fact]
+    public void ManualNoteOverride_WithoutAvaloniaVirtual_StaysUntouched()
+    {
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class C : Window
+                {
+                    protected override void OnActivated(EventArgs e) { }
+                }
+            }
+            """);
+
+        // Window 激活无虚方法：不改签名，仅人工提示
+        Assert.Contains("OnActivated(EventArgs e)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL");
+    }
+
+    [Fact]
+    public void OnClosingOverride_ParamForcedTo_WindowClosingEventArgs()
+    {
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class C : Window
+                {
+                    protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+                    {
+                        base.OnClosing(e);
+                        e.Cancel = true;
+                    }
+                }
+            }
+            """);
+
+        // 方法名不变，参数类型强制覆盖（e.Cancel 在 WindowClosingEventArgs 上存在）
+        Assert.Contains("protected override void OnClosing(global::Avalonia.Controls.WindowClosingEventArgs e)", r.Code);
+        Assert.Contains("e.Cancel = true", r.Code);
+    }
+
+    // ---------------------------------------------- WPF 独有命名空间（CS-WPFONLY-*）
+
+    [Fact]
+    public void WpfOnlyUsing_IsRemoved()
+    {
+        var r = Transform("""
+            using System.Windows;
+            using System.Windows.Interop;
+            using System.Windows.Navigation;
+
+            namespace Demo
+            {
+                class C { }
+            }
+            """);
+
+        // WPF 独有命名空间 using 整条移除（Avalonia 无等价）
+        Assert.DoesNotContain("System.Windows.Interop", r.Code);
+        Assert.DoesNotContain("System.Windows.Navigation", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-USING-WPFONLY");
+    }
+
+    [Fact]
+    public void WpfOnlyQualifiedReference_IsPreserved_WithManualNote()
+    {
+        var r = Transform("""
+            namespace Demo
+            {
+                class C
+                {
+                    object M(object w)
+                    {
+                        var h = new System.Windows.Interop.WindowInteropHelper(w);
+                        return h;
+                    }
+                }
+            }
+            """);
+
+        // 限定引用保留原样（不能错映射为 global::Avalonia.Interop.*）+ 人工提示
+        Assert.Contains("new System.Windows.Interop.WindowInteropHelper(w)", r.Code);
+        Assert.DoesNotContain("Avalonia.Interop", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-WPFONLY-REF");
+    }
 }

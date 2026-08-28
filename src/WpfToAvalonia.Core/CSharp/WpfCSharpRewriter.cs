@@ -140,6 +140,15 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
 
     public override SyntaxNode? VisitQualifiedName(QualifiedNameSyntax node)
     {
+        // WPF 独有命名空间：整棵子树原样保留，不下降访问（否则内层 System.Windows
+        // 会被前缀重写成 global::Avalonia，破坏外部名字；且 text==prefix 时
+        // ParseName 返回 AliasQualifiedNameSyntax，强转会 InvalidCastException）
+        var text = node.ToString();
+        if (TryWpfOnlyNs(text, out _))
+        {
+            NoteWpfOnlyQualified(node, text);
+            return node;
+        }
         var rewritten = RewriteQualified(node, out var changed);
         if (changed) return rewritten!.WithTriviaFrom(node);
         return base.VisitQualifiedName(node);
@@ -766,7 +775,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 {
                     var param = SyntaxFactory.Parameter(default, default,
                         SyntaxFactory.ParseTypeName("global::Avalonia.Controls.Primitives.TemplateAppliedEventArgs"),
-                        SyntaxFactory.Identifier("e"), null);
+                        SyntaxFactory.Identifier("e").WithLeadingTrivia(SyntaxFactory.Space), null);
                     renamed = renamed.WithParameterList(
                         SyntaxFactory.ParameterList(SyntaxFactory.SeparatedList(new[] { param }))
                             .WithTriviaFrom(node.ParameterList));
@@ -938,12 +947,15 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         return list.WithParameters(list.Parameters.Replace(old, old.WithType(newType)));
     }
 
-    /// <summary>文本是否命中 WPF 独有命名空间前缀（System.Windows.Interop.X 等）。</summary>
+    /// <summary>
+    /// 文本是否命中 WPF 独有命名空间：完整名（System.Windows.Interop，嵌套限定名的
+    /// Left 部分）或其前缀（System.Windows.Interop.X 成员访问）。
+    /// </summary>
     private static bool TryWpfOnlyNs(string text, out string ns)
     {
         foreach (var candidate in KnownMaps.WpfOnlyNamespaces)
         {
-            if (text.StartsWith(candidate + ".", StringComparison.Ordinal))
+            if (text == candidate || text.StartsWith(candidate + ".", StringComparison.Ordinal))
             {
                 ns = candidate;
                 return true;
@@ -964,16 +976,14 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         return true;
     }
 
-    private QualifiedNameSyntax? RewriteQualified(QualifiedNameSyntax node, out bool changed)
+    /// <summary>
+    /// 全限定名前缀重写（System.Windows.Controls.ListBox 等）。
+    /// 返回 NameSyntax：text == prefix 精确命中时结果是 global::Avalonia
+    /// （AliasQualifiedNameSyntax），不能强转 QualifiedNameSyntax。
+    /// </summary>
+    private NameSyntax? RewriteQualified(QualifiedNameSyntax node, out bool changed)
     {
         var text = node.ToString();
-        // WPF 独有命名空间：保留原样（声明位置引用），仅提示（不改写，避免落入 System.Windows 前缀替换）
-        if (TryWpfOnlyNs(text, out _))
-        {
-            NoteWpfOnlyQualified(node, text);
-            changed = false;
-            return null;
-        }
         foreach (var (prefix, replacement) in QualifiedPrefixes)
         {
             if (text.StartsWith(prefix + ".", StringComparison.Ordinal) || text == prefix)
@@ -981,7 +991,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 WpfDetected = true;
                 changed = true;
                 Note(node, NoteSeverity.Info, "CS-QUALIFIED", $"{prefix}.* → {replacement}.*");
-                return (QualifiedNameSyntax)SyntaxFactory.ParseName(replacement + text[prefix.Length..]);
+                return SyntaxFactory.ParseName(replacement + text[prefix.Length..]);
             }
         }
         changed = false;
