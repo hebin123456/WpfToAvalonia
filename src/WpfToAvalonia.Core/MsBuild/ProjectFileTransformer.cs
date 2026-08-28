@@ -32,6 +32,24 @@ public sealed class ProjectFileTransformer
         ("WPFToolkit", "WPF 控件库", "Avalonia 核心控件"),
         ("FluentWPF", "WPF 控件库", "FluentTheme"),
         ("ControlzEx", "WPF 控件基础设施", "Avalonia 内置"),
+        // OxyPlot.Wpf：WPF 绘图控件（ForkPlus 统计图表用；其 PlotView : Control 引发
+        // 314 处 CS0012 级联：要求引用 PresentationFramework）。Avalonia 侧无官方移植，
+        // 社区可选 ScottPlot.Avalonia / LiveChartsCore.SkiaSharpView.Avalonia。
+        ("OxyPlot.Wpf", "WPF 绘图控件库（PlotView 继承 WPF Control，引发 PresentationFramework 级联错误）", "ScottPlot.Avalonia / LiveChartsCore.SkiaSharpView.Avalonia / 手工自绘"),
+    };
+
+    /// <summary>
+    /// 1:1 官方/社区移植包替换（非隔离）：包名替换 + 版本对齐 Avalonia 12，
+    /// 命名空间重排由 C# 重写器同步处理（ICSharpCode.AvalonEdit.* → AvaloniaEdit.*，
+    /// 见 KnownMaps.CSharpNamespaces）。
+    /// Avalonia.AvaloniaEdit 12.0.0 经 NuGet 元数据验证（官方 avaloniaui 组织，Avalonia 12 对齐）。
+    /// </summary>
+    private static readonly (string FromId, string ToId, string Version, string Note)[] PackageReplacements =
+    {
+        ("AvalonEdit", "Avalonia.AvaloniaEdit", "12.0.0",
+            "WPF ICSharpCode.AvalonEdit → 官方 avaloniaui 组织的 Avalonia.AvaloniaEdit（Avalonia 12 对齐版本）；" +
+            "命名空间 ICSharpCode.AvalonEdit.* → AvaloniaEdit.* 已由 C# 重写器同步改写；" +
+            "API 高度兼容（TextEditor/TextArea/Margin 体系同名），DrawingContext API 差异见转换报告提示。"),
     };
 
     private readonly ConversionOptions _options;
@@ -121,6 +139,22 @@ public sealed class ProjectFileTransformer
         {
             item.Name = XName.Get("AvaloniaResource", item.Name.NamespaceName);
             Note("PROJ-RESOURCE", $"Resource → AvaloniaResource（{item.Attribute("Include")?.Value}）。");
+        }
+
+        // —— 1:1 包替换（AvalonEdit → Avalonia.AvaloniaEdit 等）：替换优先于隔离 ——
+        foreach (var item in root.Descendants()
+                     .Where(e => e.Name.LocalName == "PackageReference").ToList())
+        {
+            var id = item.Attribute("Include")?.Value?.Trim();
+            if (id == null) continue;
+            var rep = PackageReplacements.FirstOrDefault(r =>
+                r.FromId.Equals(id, StringComparison.OrdinalIgnoreCase));
+            if (rep.FromId == null) continue;
+
+            item.SetAttributeValue("Include", rep.ToId);
+            item.SetAttributeValue("Version", rep.Version);
+            _notes.Add(new ConversionNote(_file, 0, NoteSeverity.Info, "PROJ-PACKAGE-REPLACE",
+                $"PackageReference {id} → {rep.ToId} {rep.Version}。{rep.Note}"));
         }
 
         // —— WPF-only 包隔离：避免 NETSDK1136 强制 -windows TFM，转注释待人工替换 ——

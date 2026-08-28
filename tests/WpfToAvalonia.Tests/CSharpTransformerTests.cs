@@ -505,4 +505,282 @@ public class CSharpTransformerTests
         Assert.DoesNotContain("Avalonia.Interop", r.Code);
         Assert.Contains(r.Notes, n => n.Rule == "CS-WPFONLY-REF");
     }
+
+    // ============ ForkPlus 端到端 dry-run 错误驱动增强（CS0012/CS0115/CS0246） ============
+
+    [Fact]
+    public void UsingAlias_WindowState_MapsToControlsNamespace()
+    {
+        var r = Transform("""
+            using WindowState = System.Windows.WindowState;
+
+            namespace Demo
+            {
+                class C { WindowState S => WindowState.Maximized; }
+            }
+            """);
+
+        // using 别名右侧走精确全名映射（前缀替换会错位到不存在的 global::Avalonia.WindowState）
+        Assert.Contains("using WindowState = global::Avalonia.Controls.WindowState", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-QUALIFIED-EXACT");
+    }
+
+    [Fact]
+    public void MarkupExtension_RenamesToMarkupXaml()
+    {
+        var r = Transform("""
+            using System.Windows.Markup;
+
+            namespace Demo
+            {
+                class C : MarkupExtension
+                {
+                    public override object ProvideValue(IServiceProvider sp) => this;
+                }
+            }
+            """);
+
+        // System.Windows.Markup.MarkupExtension → Avalonia.Markup.Xaml 程序集（非 Avalonia.Markup！）
+        Assert.Contains("class C : global::Avalonia.Markup.Xaml.MarkupExtension", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-TYPE-RENAME");
+    }
+
+    [Fact]
+    public void OnInitializedOverride_DropsEventArgsParam_AndBaseArgs()
+    {
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class C : Window
+                {
+                    protected override void OnInitialized(EventArgs e)
+                    {
+                        base.OnInitialized(e);
+                        Init();
+                    }
+                }
+            }
+            """);
+
+        // WPF OnInitialized(EventArgs) → StyledElement.OnInitialized() 无参（反射验证）
+        Assert.Contains("protected override void OnInitialized()", r.Code);
+        Assert.Contains("base.OnInitialized()", r.Code);
+        Assert.DoesNotContain("base.OnInitialized(e)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-PARAMTRIM");
+        Assert.Contains(r.Notes, n => n.Rule == "CS-BASE-PARAMTRIM");
+    }
+
+    [Fact]
+    public void PrepareContainerForItemOverride_GainsIndexParam()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : ListBox
+                {
+                    protected override void PrepareContainerForItemOverride(DependencyObject element, object item)
+                    {
+                        base.PrepareContainerForItemOverride(element, item);
+                    }
+                }
+            }
+            """);
+
+        // WPF (DependencyObject, object) → Avalonia 12 (Control, object, int index)
+        Assert.Contains("PrepareContainerForItemOverride(global::Avalonia.Controls.Control element, object item, int index)", r.Code);
+        Assert.Contains("base.PrepareContainerForItemOverride(element, item, index)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-PARAMAPPEND");
+    }
+
+    [Fact]
+    public void ClearContainerForItemOverride_LosesSecondParam()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : ListBox
+                {
+                    protected override void ClearContainerForItemOverride(DependencyObject element, object item)
+                    {
+                        base.ClearContainerForItemOverride(element, item);
+                    }
+                }
+            }
+            """);
+
+        // WPF (DependencyObject, object) → Avalonia 12 (Control) 单参
+        Assert.Contains("ClearContainerForItemOverride(global::Avalonia.Controls.Control element)", r.Code);
+        Assert.Contains("base.ClearContainerForItemOverride(element)", r.Code);
+        Assert.DoesNotContain("base.ClearContainerForItemOverride(element, item)", r.Code);
+    }
+
+    [Fact]
+    public void ParamListSeparatorTrivia_PreservedAfterTrimAndAppend()
+    {
+        // 回归：重建 SeparatedList 曾丢失逗号后空格（element,object / item,intindex）
+        var trim = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : ListBox
+                {
+                    protected override void ClearContainerForItemOverride(DependencyObject element, object item)
+                    {
+                        base.ClearContainerForItemOverride(element, item);
+                    }
+                }
+            }
+            """);
+        Assert.DoesNotContain("element,item", trim.Code);
+
+        var append = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                class C : ListBox
+                {
+                    protected override void PrepareContainerForItemOverride(DependencyObject element, object item)
+                    {
+                        base.PrepareContainerForItemOverride(element, item);
+                    }
+                }
+            }
+            """);
+        Assert.DoesNotContain("element,object", append.Code);
+        Assert.DoesNotContain("item,intindex", append.Code);
+        Assert.DoesNotContain(",item, index", append.Code);
+    }
+
+    [Fact]
+    public void OnPreviewMouseRightButtonDown_MapsToPointerPressed()
+    {
+        var r = Transform("""
+            using System.Windows.Controls;
+            using System.Windows.Input;
+
+            namespace Demo
+            {
+                class C : TreeView
+                {
+                    protected override void OnPreviewMouseRightButtonDown(MouseButtonEventArgs e)
+                    {
+                        base.OnPreviewMouseRightButtonDown(e);
+                    }
+                }
+            }
+            """);
+
+        Assert.Contains("OnPointerPressed(global::Avalonia.Input.PointerPressedEventArgs e)", r.Code);
+        Assert.Contains("base.OnPointerPressed(e)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-RENAME");
+    }
+
+    [Fact]
+    public void OnCheckedOverride_KeepsSignature_WithManualNote()
+    {
+        var r = Transform("""
+            using System.Windows.Controls.Primitives;
+
+            namespace Demo
+            {
+                class C : ToggleButton
+                {
+                    protected override void OnChecked(RoutedEventArgs e) { }
+                    protected override void OnContentChanged(object oldContent, object newContent) { }
+                }
+            }
+            """);
+
+        // ToggleButton 无 OnChecked/OnChecked 虚方法、ContentControl 无 OnContentChanged：保留签名 + 人工提示
+        Assert.Contains("OnChecked(RoutedEventArgs e)", r.Code);
+        Assert.Contains("OnContentChanged(object oldContent, object newContent)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL" && n.Message.Contains("OnIsCheckedChanged"));
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL" && n.Message.Contains("OnContentChanged"));
+    }
+
+    [Fact]
+    public void IMultiValueConverter_ObjectArrayParam_BecomesIList()
+    {
+        var r = Transform("""
+            using System;
+            using System.Globalization;
+            using System.Windows.Data;
+
+            namespace Demo
+            {
+                class C : IMultiValueConverter
+                {
+                    public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture) => null;
+                }
+            }
+            """);
+
+        // 反射验证 Avalonia 12：IMultiValueConverter.Convert(IList<object>, Type, object, CultureInfo)
+        Assert.Contains("global::System.Collections.Generic.IList<object> values", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-IMVC-ARGS");
+    }
+
+    [Fact]
+    public void AvalonEditNamespaces_RewrittenToAvaloniaEdit()
+    {
+        var r = Transform("""
+            using ICSharpCode.AvalonEdit.Editing;
+            using ICSharpCode.AvalonEdit.Rendering;
+
+            namespace Demo
+            {
+                class C
+                {
+                    ICSharpCode.AvalonEdit.Document.TextDocument Doc() => null;
+                }
+            }
+            """);
+
+        // Avalonia.AvaloniaEdit 12.0.0 命名空间重排：ICSharpCode.AvalonEdit.* → AvaloniaEdit.*
+        Assert.Contains("using AvaloniaEdit.Editing", r.Code);
+        Assert.Contains("using AvaloniaEdit.Rendering", r.Code);
+        Assert.Contains("AvaloniaEdit.Document.TextDocument", r.Code);
+        Assert.DoesNotContain("ICSharpCode", r.Code);
+    }
+
+    [Fact]
+    public void ThemeInfoAttribute_IsRemoved()
+    {
+        var r = Transform("""
+            using System.Windows;
+
+            [assembly: ThemeInfo(ResourceDictionaryLocation.None, ResourceDictionaryLocation.SourceAssembly)]
+
+            namespace Demo { }
+            """);
+
+        Assert.DoesNotContain("ThemeInfo", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-THEMEINFO-REMOVED");
+    }
+
+    [Fact]
+    public void WpfOnlyType_GetsManualNote_WithAlternative()
+    {
+        var r = Transform("""
+            namespace Demo
+            {
+                class C
+                {
+                    object M() => new Adorner(null);
+                }
+            }
+            """);
+
+        // WPF 独有类型：保留原名 + 人工提示（替代方案指引）
+        Assert.Contains("new Adorner(null)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-WPFONLY-TYPE" && n.Message.Contains("Overlay"));
+    }
 }

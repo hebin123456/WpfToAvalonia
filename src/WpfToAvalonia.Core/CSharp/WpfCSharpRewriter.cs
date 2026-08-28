@@ -18,6 +18,9 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private readonly List<ConversionNote> _notes = new();
     private readonly HashSet<string> _dedupe = new();
     private readonly Stack<string> _methodNames = new();
+    /// <summary>与 _methodNames 并行：当前方法（虚方法重写后）的声明参数个数。
+    /// base.Xxx(...) 实参同步增删的期望值（-1 = 未重写，无需同步）。</summary>
+    private readonly Stack<int> _methodParamCounts = new();
     /// <summary>类级撞名原方法名栈（VisitClassDeclaration 预扫描，见 CS-OVERRIDE-CLASH）。</summary>
     private readonly Stack<HashSet<string>> _clashOriginals = new();
     private static readonly HashSet<string> NoClashes = new();
@@ -29,6 +32,8 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     /// <summary>全限定前缀映射（长前缀优先）。</summary>
     private static readonly (string Prefix, string Replacement)[] QualifiedPrefixes =
     {
+        // WPF AvalonEdit → Avalonia.AvaloniaEdit 12.0.0（官方包替换，命名空间整体重排）
+        ("ICSharpCode.AvalonEdit", "global::AvaloniaEdit"),
         ("System.Windows.Media.Imaging", "global::Avalonia.Media.Imaging"),
         // WPF 动画命名空间 → Avalonia.Animation（不是 Avalonia.Media.Animation！）
         ("System.Windows.Media.Animation", "global::Avalonia.Animation"),
@@ -325,6 +330,15 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             Note(node, severity, "CS-TYPE-RENAME", $"类型 {name} → {mapped}");
             return SyntaxFactory.ParseName(mapped).WithTriviaFrom(node);
         }
+
+        // WPF 独有类型（无 Avalonia 等价）：保留原名 + 每类型一次人工提示
+        //（ForkPlus 端到端 CS0246 错误驱动；避免裸报错无指引）
+        if (KnownMaps.WpfOnlyTypes.TryGetValue(name, out var wpfOnlyNote) &&
+            IsTypePosition(node) && _dedupe.Add("WPFTYPE:" + name))
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Manual, "CS-WPFONLY-TYPE", $"类型 {name}：{wpfOnlyNote}");
+        }
         return base.VisitIdentifierName(node);
     }
 
@@ -366,6 +380,9 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         // override 方法改了名（OnMouseDown→OnPointerPressed 等），方法体内的
         // base.OnMouseDown(e) 调用必须同步重命名，否则 CS0115。
         // 撞名保留原名的方法（CS-OVERRIDE-CLASH）不改，保持与声明一致。
+        // 参数个数映射（TargetParamCount/AppendParams）同步作用于 base 实参列表
+        //（OnInitialized 截断实参；PrepareContainerForItemOverride 补 index 实参——
+        //  实参名取自 override 声明追加的参数名，声明与调用在同一方法内一致）。
         if (node.Expression is MemberAccessExpressionSyntax bma &&
             bma.Expression is BaseExpressionSyntax &&
             KnownMaps.OverrideMethodRenames.TryGetValue(bma.Name.Identifier.ValueText, out var bmap) &&
@@ -375,8 +392,19 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             WpfDetected = true;
             Note(node, NoteSeverity.Info, "CS-BASE-RENAME",
                 $"base.{bma.Name.Identifier.ValueText}(...) → base.{bmap.NewName}(...)（虚方法重命名的 base 调用同步改写）。");
-            return node.WithExpression(
+            var renamedCall = node.WithExpression(
                 bma.WithName(SyntaxFactory.IdentifierName(bmap.NewName).WithTriviaFrom(bma.Name)));
+            return SyncBaseCallArguments(renamedCall, bmap);
+        }
+        // 同名映射（OnInitialized/PrepareContainerForItemOverride/ClearContainerForItemOverride：
+        // 方法名未变但参数个数变了）：base 实参列表同步增删
+        if (node.Expression is MemberAccessExpressionSyntax bma0 &&
+            bma0.Expression is BaseExpressionSyntax &&
+            KnownMaps.OverrideMethodRenames.TryGetValue(bma0.Name.Identifier.ValueText, out var bmap0) &&
+            (bmap0.TargetParamCount != null || bmap0.AppendParams is { Length: > 0 }) &&
+            !IsInClashMethod())
+        {
+            return SyncBaseCallArguments(node, bmap0);
         }
         // base.OnApplyTemplate() 同步补参（方法名未变但 Avalonia 12 签名带参）
         if (node.Expression is MemberAccessExpressionSyntax bma2 &&
@@ -738,9 +766,32 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
 
     // ------------------------------------------------------------------ 其它
 
+    /// <summary>
+    /// [assembly: ThemeInfo(...)] 特性整条删除：WPF 主题资源位置声明，Avalonia 无等价
+    ///（主题经 App.Styles / ResourceInclude 引入；ForkPlus AssemblyInfo.cs 实测 CS0246）。
+    /// AttributeList 作为 SyntaxList 成员，返回 null 由列表访问器剔除。
+    /// </summary>
+    public override SyntaxNode? VisitAttributeList(AttributeListSyntax node)
+    {
+        var isThemeInfo = node.Attributes.Any(a =>
+        {
+            var n = a.Name.ToString();
+            return n is "ThemeInfo" or "ThemeInfoAttribute" or "System.Windows.ThemeInfo";
+        });
+        if (isThemeInfo)
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-THEMEINFO-REMOVED",
+                "ThemeInfo 特性已删除（WPF 主题资源位置声明，Avalonia 主题经 App.Styles 引入）。");
+            return null;
+        }
+        return base.VisitAttributeList(node);
+    }
+
     public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
     {
         _methodNames.Push(node.Identifier.ValueText);
+        _methodParamCounts.Push(-1); // 占位：未重写时无需同步 base 实参
         try
         {
             var name = node.Identifier.ValueText;
@@ -769,6 +820,47 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 if (map.Param1Type != null && renamed.ParameterList.Parameters.Count > 1)
                     renamed = renamed.WithParameterList(
                         WithParamType(renamed.ParameterList, 1, map.Param1Type));
+
+                // 参数个数校准（TargetParamCount）：截断多余参数（Avalonia 签名更短时）
+                //（OnInitialized 去 EventArgs；ClearContainerForItemOverride 删第 2 参）
+                if (map.TargetParamCount is int target &&
+                    renamed.ParameterList.Parameters.Count > target)
+                {
+                    var removed = renamed.ParameterList.Parameters.Skip(target)
+                        .Select(p => p.Identifier.ValueText).ToList();
+                    renamed = renamed.WithParameterList(
+                        WithParamCount(renamed.ParameterList, target));
+                    Note(node, NoteSeverity.Warning, "CS-OVERRIDE-PARAMTRIM",
+                        $"参数已截断至 {target} 个（删除 {string.Join("/", removed)}）；"
+                        + "方法体内对已删参数的引用需人工清理，base 调用实参已同步截断。");
+                }
+
+                // 参数追加（AppendParams）：补齐 Avalonia 签名多出的参数
+                //（PrepareContainerForItemOverride 补 int index）
+                if (map.AppendParams is { Length: > 0 } appends)
+                {
+                    var appendedNames = new List<string>();
+                    var parameters = renamed.ParameterList.Parameters.ToList();
+                    foreach (var append in appends)
+                    {
+                        // "int index" → 类型 + 名字（名字用于方法体内引用与 base 调用补参）
+                        var lastSpace = append.LastIndexOf(' ');
+                        var typeText = append[..lastSpace].Trim();
+                        var nameText = append[(lastSpace + 1)..].Trim();
+                        appendedNames.Add(nameText);
+                        // 标识符前补空格（否则类型与名字粘连：intindex）
+                        parameters.Add(SyntaxFactory.Parameter(default, default,
+                            SyntaxFactory.ParseTypeName(typeText),
+                            SyntaxFactory.Identifier(nameText).WithLeadingTrivia(SyntaxFactory.Space), null));
+                    }
+                    var close = renamed.ParameterList.CloseParenToken;
+                    var open = renamed.ParameterList.OpenParenToken;
+                    var list = SyntaxFactory.ParameterList(open, Reseparate(renamed.ParameterList.Parameters, parameters), close);
+                    renamed = renamed.WithParameterList(list.WithTriviaFrom(renamed.ParameterList));
+                    Note(node, NoteSeverity.Warning, "CS-OVERRIDE-PARAMAPPEND",
+                        $"参数已追加：{string.Join(", ", appends)}（{name} → {map.NewName} 的 Avalonia 12 签名）；"
+                        + "base 调用实参已同步补齐。");
+                }
 
                 // OnApplyTemplate：WPF 无参 → 补 TemplateAppliedEventArgs e（base 调用同步补参）
                 if (name == "OnApplyTemplate" && renamed.ParameterList.Parameters.Count == 0)
@@ -802,6 +894,9 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                         + "base.OnApplyTemplate() 调用已补 (e)，模板部件查找用 this.FindControl<T>(\"PART_X\")。");
 
                 node = renamed;
+                // base 实参同步的期望值：重写后的声明参数个数（截断/追加已生效）
+                _methodParamCounts.Pop();
+                _methodParamCounts.Push(renamed.ParameterList.Parameters.Count);
             }
             // —— 无覆盖点/已 sealed 的虚方法：保留签名 + 人工提示 ——
             else if (isOverride && KnownMaps.OverrideMethodManualNotes.TryGetValue(name, out var manualNote))
@@ -815,6 +910,27 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 WpfDetected = true;
                 Note(node, NoteSeverity.Manual, "CS-ONPROPERTYCHANGED",
                     "OnPropertyChanged(DependencyPropertyChangedEventArgs) 签名不同；Avalonia 请重写 OnPropertyChanged<T>(AvaloniaPropertyChangedEventArgs<T>)。");
+            }
+
+            // —— IMultiValueConverter.Convert/ConvertBack：object[] values → IList<object> values ——
+            //（反射验证 Avalonia 12：Convert(IList<object>, Type, object, CultureInfo)；
+            //  WPF object[] 覆盖 → CS0535 接口成员未实现，ForkPlus 7 个转换器实测）
+            if ((name == "Convert" || name == "ConvertBack") &&
+                node.ParameterList.Parameters.Count > 0 &&
+                node.ParameterList.Parameters[0].Type is ArrayTypeSyntax ats &&
+                ats.ElementType is PredefinedTypeSyntax pt &&
+                pt.Keyword.IsKind(SyntaxKind.ObjectKeyword))
+            {
+                var p0 = node.ParameterList.Parameters[0];
+                var newType = SyntaxFactory.ParseTypeName("global::System.Collections.Generic.IList<object>")
+                    .WithTriviaFrom(p0.Type!);
+                node = node.WithParameterList(
+                    node.ParameterList.WithParameters(
+                        node.ParameterList.Parameters.Replace(p0, p0.WithType(newType))));
+                WpfDetected = true;
+                Note(node, NoteSeverity.Info, "CS-IMVC-ARGS",
+                    "IMultiValueConverter.Convert 参数 object[] values → IList<object> values"
+                    + "（Avalonia 12 接口签名；方法体内 values.Length → values.Count 需人工校对）。");
             }
 
             // OnRender 未被重命名的残余情况（如撞名保留原名）：提示人工
@@ -831,6 +947,7 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         }
         finally
         {
+            _methodParamCounts.Pop();
             _methodNames.Pop();
         }
     }
@@ -947,6 +1064,82 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         return list.WithParameters(list.Parameters.Replace(old, old.WithType(newType)));
     }
 
+    /// <summary>截断参数列表至 count 个（保留既有分隔符 trivia，见 Reseparate）。</summary>
+    private static ParameterListSyntax WithParamCount(ParameterListSyntax list, int count)
+    {
+        var kept = list.Parameters.Take(count).ToList();
+        var rebuilt = SyntaxFactory.ParameterList(
+            list.OpenParenToken, Reseparate(list.Parameters, kept), list.CloseParenToken);
+        return rebuilt.WithTriviaFrom(list);
+    }
+
+    /// <summary>
+    /// 重建参数/实参 SeparatedList，保留既有节点间分隔符的 trivia。
+    /// 直接 SyntaxFactory.SeparatedList(nodes) 会重新生成全部分隔符，
+    /// 丢失逗号后的空格（DependencyObject element, object item → element,object）；
+    /// 截断时丢弃多余分隔符，追加时新增「逗号+空格」分隔符。
+    /// </summary>
+    private static SeparatedSyntaxList<TNode> Reseparate<TNode>(SeparatedSyntaxList<TNode> original, IReadOnlyList<TNode> nodes)
+        where TNode : SyntaxNode
+    {
+        // 保留前缀节点数：既有节点与新列表的较小者（截断场景）
+        var prefix = Math.Min(original.Count, nodes.Count);
+        var separators = new List<SyntaxToken>();
+        for (var i = 0; i < prefix - 1; i++)
+            separators.Add(original.GetSeparator(i));
+        for (var i = prefix; i < nodes.Count; i++)
+            separators.Add(SyntaxFactory.Token(SyntaxKind.CommaToken).WithTrailingTrivia(SyntaxFactory.Space));
+        return SyntaxFactory.SeparatedList(nodes, separators);
+    }
+
+    /// <summary>
+    /// base.Xxx(...) 调用实参列表随参数个数映射同步增删。
+    /// 期望实参数取自 _methodParamCounts 栈顶（当前 override 方法映射后的声明参数数，
+    /// 由 VisitMethodDeclaration 在访问方法体前压栈）：
+    /// 多则截断（base.OnInitialized(e) → base.OnInitialized()）；
+    /// 少则补 AppendParams 声明的参数名（base.Prepare(el,item) → base.Prepare(el,item,index)）。
+    /// 无需增删时原样返回。
+    /// </summary>
+    private InvocationExpressionSyntax SyncBaseCallArguments(
+        InvocationExpressionSyntax call, KnownMaps.OverrideMethodMap map)
+    {
+        var expected = _methodParamCounts.Count > 0 ? _methodParamCounts.Peek() : -1;
+        if (expected < 0) return call;
+
+        var args = call.ArgumentList;
+        var changed = false;
+
+        if (args.Arguments.Count > expected)
+        {
+            var kept = args.Arguments.Take(expected).ToList();
+            args = SyntaxFactory.ArgumentList(
+                args.OpenParenToken, Reseparate(args.Arguments, kept), args.CloseParenToken)
+                .WithTriviaFrom(call.ArgumentList);
+            changed = true;
+            WpfDetected = true;
+            Note(call, NoteSeverity.Info, "CS-BASE-PARAMTRIM",
+                $"base 调用实参已截断至 {expected} 个（与 override 声明的参数截断同步）。");
+        }
+        else if (args.Arguments.Count < expected && map.AppendParams is { Length: > 0 } appends)
+        {
+            var need = expected - args.Arguments.Count;
+            var names = appends.TakeLast(need)
+                .Select(a => a[(a.LastIndexOf(' ') + 1)..].Trim());
+            var list = args.Arguments.ToList();
+            foreach (var n in names)
+                list.Add(SyntaxFactory.Argument(SyntaxFactory.IdentifierName(n)));
+            args = SyntaxFactory.ArgumentList(
+                args.OpenParenToken, Reseparate(args.Arguments, list), args.CloseParenToken)
+                .WithTriviaFrom(call.ArgumentList);
+            changed = true;
+            WpfDetected = true;
+            Note(call, NoteSeverity.Info, "CS-BASE-PARAMAPPEND",
+                $"base 调用实参已补齐至 {expected} 个（与 override 声明的参数追加同步）。");
+        }
+
+        return changed ? call.WithArgumentList(args) : call;
+    }
+
     /// <summary>
     /// 文本是否命中 WPF 独有命名空间：完整名（System.Windows.Interop，嵌套限定名的
     /// Left 部分）或其前缀（System.Windows.Interop.X 成员访问）。
@@ -980,10 +1173,20 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     /// 全限定名前缀重写（System.Windows.Controls.ListBox 等）。
     /// 返回 NameSyntax：text == prefix 精确命中时结果是 global::Avalonia
     /// （AliasQualifiedNameSyntax），不能强转 QualifiedNameSyntax。
+    /// 精确全名（QualifiedTypeRenames）优先于前缀替换：跨命名空间移动的类型
+    /// （WindowState/MarkupExtension/BitmapImage）与前缀替换会落到错误的
+    /// 命名空间（如 global::Avalonia.WindowState 不存在——using 别名实测）。
     /// </summary>
     private NameSyntax? RewriteQualified(QualifiedNameSyntax node, out bool changed)
     {
         var text = node.ToString();
+        if (KnownMaps.QualifiedTypeRenames.TryGetValue(text, out var exact))
+        {
+            WpfDetected = true;
+            changed = true;
+            Note(node, NoteSeverity.Info, "CS-QUALIFIED-EXACT", $"{text} → {exact}（精确全名映射，跨命名空间移动的类型）。");
+            return SyntaxFactory.ParseName(exact);
+        }
         foreach (var (prefix, replacement) in QualifiedPrefixes)
         {
             if (text.StartsWith(prefix + ".", StringComparison.Ordinal) || text == prefix)

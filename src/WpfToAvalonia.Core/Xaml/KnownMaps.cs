@@ -272,6 +272,25 @@ public static class KnownMaps
     }
 
     /// <summary>
+    /// WPF Window.ResizeMode 枚举值 → Avalonia Window.CanResize bool 值。
+    ///（反射验证：Avalonia 12 无 ResizeMode 枚举，仅 CanResize bool。）
+    /// 返回 (canResize, isLossy)：isLossy=true 表示语义有损（CanMinimize/grip）。
+    /// </summary>
+    public static (string? Value, bool Lossy) ResizeModeToCanResize(string? value)
+    {
+        return value?.Trim() switch
+        {
+            "NoResize" => ("False", false),
+            // CanMinimize：允许最小化但禁缩放；Avalonia CanResize=false 禁缩放，最小化仍可用（近似）
+            "CanMinimize" => ("False", true),
+            "CanResize" => ("True", false),
+            // CanResizeWithGrip：Avalonia 无 grip，缩放能力等价
+            "CanResizeWithGrip" => ("True", true),
+            _ => (null, false),
+        };
+    }
+
+    /// <summary>
     /// 属性路径归一化：剥除可剥除的所有者前缀，保留附加属性前缀。
     /// 兼容反编译 XAML 的 "(Owner.Prop)" 括号写法。
     /// </summary>
@@ -338,6 +357,23 @@ public static class KnownMaps
         ["System.Windows.Documents"] = "Avalonia.Controls.Documents",
         ["System.Windows.Interactivity"] = "Avalonia.Xaml.Interactivity",
         ["Microsoft.Xaml.Behaviors.Wpf"] = "Avalonia.Xaml.Behaviors",
+        // —— Avalonia.AvaloniaEdit 12.0.0（官方 avaloniaui 组织）：WPF ICSharpCode.AvalonEdit
+        // 的包替换映射，命名空间整体从 ICSharpCode.AvalonEdit.* 重排为 AvaloniaEdit.*
+        //（14 个子命名空间经程序集反射全量枚举验证；AbstractMargin 移入 .Editing）。
+        // 配套 csproj 包替换：AvalonEdit → Avalonia.AvaloniaEdit 12.0.0。
+        ["ICSharpCode.AvalonEdit"] = "AvaloniaEdit",
+        ["ICSharpCode.AvalonEdit.CodeCompletion"] = "AvaloniaEdit.CodeCompletion",
+        ["ICSharpCode.AvalonEdit.Document"] = "AvaloniaEdit.Document",
+        ["ICSharpCode.AvalonEdit.Editing"] = "AvaloniaEdit.Editing",
+        ["ICSharpCode.AvalonEdit.Folding"] = "AvaloniaEdit.Folding",
+        ["ICSharpCode.AvalonEdit.Highlighting"] = "AvaloniaEdit.Highlighting",
+        ["ICSharpCode.AvalonEdit.Highlighting.Xshd"] = "AvaloniaEdit.Highlighting.Xshd",
+        ["ICSharpCode.AvalonEdit.Indentation"] = "AvaloniaEdit.Indentation",
+        ["ICSharpCode.AvalonEdit.Indentation.CSharp"] = "AvaloniaEdit.Indentation.CSharp",
+        ["ICSharpCode.AvalonEdit.Rendering"] = "AvaloniaEdit.Rendering",
+        ["ICSharpCode.AvalonEdit.Search"] = "AvaloniaEdit.Search",
+        ["ICSharpCode.AvalonEdit.Snippets"] = "AvaloniaEdit.Snippets",
+        ["ICSharpCode.AvalonEdit.Utils"] = "AvaloniaEdit.Utils",
     };
 
     /// <summary>
@@ -388,6 +424,17 @@ public static class KnownMaps
         ["Hyperlink"] = "global::Avalonia.Controls.HyperlinkButton",
         // 窗口状态枚举位置（成员访问名不受影响）
         ["WindowState"] = "global::Avalonia.Controls.WindowState",
+        // 窗口启动位置枚举（反射验证 Avalonia.Controls.WindowStartupLocation）
+        ["WindowStartupLocation"] = "global::Avalonia.Controls.WindowStartupLocation",
+        // 内容自适应枚举（反射验证 Avalonia.Controls.SizeToContent）
+        ["SizeToContent"] = "global::Avalonia.Controls.SizeToContent",
+        // WPF System.Windows.Markup.MarkupExtension → Avalonia.Markup.Xaml 程序集
+        //（前缀替换会得到不存在的 Avalonia.Markup.MarkupExtension，32 处 CS0246 实测）
+        ["MarkupExtension"] = "global::Avalonia.Markup.Xaml.MarkupExtension",
+        ["IComponentConnector"] = "global::Avalonia.Markup.Xaml.IComponentConnector",
+        // WPF ContextMenuEventArgs → ContextRequested 事件参数（Handled 语义保留，
+        // 但无 CursorLeft/Source 属性，标记 WARN；反射验证 Avalonia.Input）
+        ["ContextMenuEventArgs"] = "global::Avalonia.Input.ContextRequestedEventArgs",
         // Avalonia 12 已移除 Visibility 枚举 → bool（IsVisible）；Hidden/Collapsed 语义合并
         ["Visibility"] = "bool",
     };
@@ -395,9 +442,14 @@ public static class KnownMaps
     /// <summary>
     /// 虚方法覆盖重写映射（WPF 覆盖虚方法 → Avalonia 12 虚方法）。
     /// Param0Type/Param1Type 为 null 表示保留原参数类型（已由 TypeRenames 处理）；
-    /// Access 非 null 时强制调整可访问性（Render 须 public / OnApplyTemplate 须 protected）。
+    /// Access 非 null 时强制调整可访问性（Render 须 public / OnApplyTemplate 须 protected）；
+    /// TargetParamCount 非 null 时截断/校准参数个数（OnInitialized 去参 / ClearContainerForItemOverride 删参）；
+    /// AppendParams 为追加参数的类型+名字（PrepareContainerForItemOverride 补 int index）。
+    /// base.Xxx(...) 调用的实参列表会同步增删。
     /// </summary>
-    public sealed record OverrideMethodMap(string NewName, string? Param0Type, string? Param1Type = null, string? Access = null);
+    public sealed record OverrideMethodMap(
+        string NewName, string? Param0Type, string? Param1Type = null, string? Access = null,
+        int? TargetParamCount = null, string[]? AppendParams = null);
 
     /// <summary>
     /// WPF 覆盖虚方法 → Avalonia 12 虚方法（方法名/参数类型/可访问性强制覆盖）。
@@ -422,6 +474,9 @@ public static class KnownMaps
             ["OnPreviewMouseLeftButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
             ["OnMouseRightButtonDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
             ["OnMouseRightButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
+            // 右键 Preview 变体（MultiselectionTreeView.OnPreviewMouseRightButtonDown 实测 CS0115）
+            ["OnPreviewMouseRightButtonDown"] = new("OnPointerPressed", "global::Avalonia.Input.PointerPressedEventArgs"),
+            ["OnPreviewMouseRightButtonUp"] = new("OnPointerReleased", "global::Avalonia.Input.PointerReleasedEventArgs"),
             ["OnMouseMove"] = new("OnPointerMoved", "global::Avalonia.Input.PointerEventArgs"),
             ["OnPreviewMouseMove"] = new("OnPointerMoved", "global::Avalonia.Input.PointerEventArgs"),
             ["OnMouseEnter"] = new("OnPointerEntered", "global::Avalonia.Input.PointerEventArgs"),
@@ -441,6 +496,18 @@ public static class KnownMaps
             //（Avalonia 12 带参 + protected；WPF public 无参覆盖 → CS0115，探针 T1/T2 验证）
             ["OnApplyTemplate"] = new("OnApplyTemplate",
                 "global::Avalonia.Controls.Primitives.TemplateAppliedEventArgs", Access: "protected"),
+            // —— 以下为 ForkPlus 端到端 dry-run CS0115 错误驱动的补充（反射探针验证）——
+            // WPF FrameworkElement.OnInitialized(EventArgs) → StyledElement.OnInitialized() 无参
+            //（反射验证：protected virtual ()，WPF 带参覆盖 → CS0115）
+            ["OnInitialized"] = new("OnInitialized", null, TargetParamCount: 0),
+            // WPF ItemsControl.PrepareContainerForItemOverride(DependencyObject, object)
+            // → Avalonia 12 (Control, object, int index)（反射验证 protected virtual 三参）
+            ["PrepareContainerForItemOverride"] = new("PrepareContainerForItemOverride",
+                "global::Avalonia.Controls.Control", AppendParams: new[] { "int index" }),
+            // WPF ClearContainerForItemOverride(DependencyObject, object) → Avalonia 12 (Control)
+            //（反射验证 protected virtual 单参；WPF 双参覆盖 → CS0115）
+            ["ClearContainerForItemOverride"] = new("ClearContainerForItemOverride",
+                "global::Avalonia.Controls.Control", TargetParamCount: 1),
         };
 
     /// <summary>
@@ -470,6 +537,12 @@ public static class KnownMaps
             ["OnSessionEnding"] = "无等价：订阅 lifetime.Exit / 系统会话事件自行处理。",
             // Layoutable.OnVisualParentChanged(Visual?, Visual?) 已 sealed：编译探针 CS0239 验证
             ["OnVisualParentChanged"] = "Layoutable.OnVisualParentChanged 已 sealed 不可覆盖：改订阅 DetachedFromVisualTree / AttachedToVisualTree 事件。",
+            // —— 以下为 ForkPlus 端到端 dry-run CS0115 错误驱动（反射验证全链 ABSENT）——
+            ["OnContentChanged"] = "ContentControl 无 OnContentChanged 虚方法：监听内容变更用 ContentProperty.GetObservable(this) / OnPropertyChanged(AvaloniaPropertyChangedEventArgs)。",
+            ["OnChecked"] = "ToggleButton 无 OnChecked/OnUnchecked 虚方法：覆盖 OnIsCheckedChanged(RoutedEventArgs) 或 IsCheckedProperty.GetObservable。",
+            ["OnUnchecked"] = "ToggleButton 无 OnChecked/OnUnchecked 虚方法：覆盖 OnIsCheckedChanged(RoutedEventArgs) 或 IsCheckedProperty.GetObservable。",
+            ["OnStateChanged"] = "Window 无 OnStateChanged 虚方法：订阅 WindowStateProperty 变更（this.GetObservable(Window.WindowStateProperty)）。",
+            ["OnIsKeyboardFocusWithinChanged"] = "无此虚方法：订阅 GotFocus/LostFocus 事件或 KeyboardNavigation 相关事件聚合实现。",
         };
 
     /// <summary>WPF 独有命名空间（Avalonia 无等价）：using 移除 / 限定引用保留并提示人工。</summary>
@@ -482,7 +555,44 @@ public static class KnownMaps
         "System.Windows.Resources",
     };
 
-    /// <summary>全限定类型映射（System.Windows.Point 等）。</summary>
+    /// <summary>
+    /// WPF 独有类型（Avalonia 无等价、且非简单改名可解）：保留原名 + 每类型一次人工提示
+    /// （ForkPlus 端到端 CS0246 错误驱动；逐一给出替代方案，避免裸报错无指引）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> WpfOnlyTypes = new Dictionary<string, string>
+    {
+        ["RequestNavigateEventArgs"] = "Hyperlink 导航事件参数无等价：HyperlinkButton.NavigateUri + Click 事件。",
+        ["Adorner"] = "WPF Adorner 体系无等价：用 Overlay/Popup 或装饰层 Canvas 叠加自绘控件实现。",
+        ["AdornerLayer"] = "WPF AdornerLayer 无等价：自建装饰管理层（Canvas + ZIndex）或 Popup。",
+        ["RoutedEventHandler"] = "WPF 路由事件委托无统一等价：按具体事件换用对应 EventHandler<TArgs>（如 EventHandler<RoutedEventArgs>）。",
+        ["ContextMenuEventHandler"] = "ContextMenuOpening/Closing 事件无等价：Avalonia 用 ContextMenu.Opening/Closing 或 Control.ContextRequested（ContextRequestedEventArgs）。",
+        ["GiveFeedbackEventArgs"] = "拖拽反馈事件无等价（Avalonia 拖拽光标自管理）。",
+        ["IWeakEventListener"] = "WPF 弱事件接口无等价：用 Avalonia 弱订阅或普通事件（Avalonia 编译 XAML 无泄漏内存路径）。",
+        ["DataObjectPastingEventArgs"] = "粘贴拦截事件无等价：Avalonia TextBox 无 DataObject.Pasting，需在 TextChanged 里校验。",
+        ["ValueConversionAttribute"] = "值转换元数据特性无等价：直接实现 IValueConverter 即可，删除特性。",
+        ["ContentPropertyAttribute"] = "类级内容属性注解无等价：Avalonia 用 [Content] 标注属性（Avalonia.Metadata）或约定 Content 属性。",
+        ["ThemeInfoAttribute"] = "WPF 主题资源位置特性无等价：整条特性已删除，Avalonia 主题经 App.Styles 引入。",
+        ["ToolTipEventArgs"] = "ToolTipOpening/Closing 事件无等价：用 ToolTip.Tip 内容或 TipClicked 自绘近似。",
+        ["SpellingError"] = "WPF 拼写检查 API 无等价：Avalonia TextBox 无内建拼写检查。",
+        ["RoutedCommand"] = "WPF RoutedCommand 体系无等价：改用 ReactiveCommand / 自定义 ICommand + 快捷键绑定（KeyBindings）。",
+        ["CommandBinding"] = "WPF CommandBinding 体系无等价：ICommand.CanExecute/Execute 直接绑定。",
+        ["ExecutedRoutedEventHandler"] = "WPF 路由命令处理器无等价：ICommand.Execute 实现。",
+        ["MouseWheelEventHandler"] = "WPF 滚轮委托无等价：Avalonia PointerWheelChanged 是 EventHandler<PointerWheelEventArgs>（泛型）。",
+        ["HwndSource"] = "HWND 互操作无等价：TopLevel.TryGetPlatformHandle() 获取平台句柄。",
+        ["GuidelineSet"] = "DrawingContext 网格对齐无等价：Avalonia DrawingContext 无 PushGuidelines，按需重算坐标。",
+        ["FrameworkElementAutomationPeer"] = "WPF UI 自动化对等类无公开等价：Avalonia 自动化内建，删除该类。",
+        ["ExitEventArgs"] = "Application 退出参数无等价：lifetime.Exit 事件（ControlledApplicationLifetimeExitEventArgs）。",
+        ["StartupEventArgs"] = "Application 启动参数无等价：OnFrameworkInitializationCompleted（无参数）。",
+        ["ControlTemplate"] = "代码创建 ControlTemplate 无等价：Avalonia 用 FuncControlTemplate<T>(x => Build) 或 XAML 内联模板。",
+        ["ResizeMode"] = "WPF ResizeMode 枚举无等价：Window.CanResize bool（NoResize/CanMinimize→false，CanResize*→true；grip 无等价）。",
+        ["RoutedPropertyChangedEventArgs"] = "WPF 值变更路由参数无等价：ValueChanged/PropertyChange 事件参数（T 类型的旧/新值属性各异）。",
+        ["CommonFileDialog"] = "WindowsAPICodePack 对话框已随包隔离：改用 Avalonia StorageProvider（IStorageProvider.OpenFilePickerAsync 等）。",
+    };
+
+    /// <summary>全限定类型映射（System.Windows.Point 等）。
+    /// 精确全名匹配优先于 QualifiedPrefixes 前缀替换——using 别名
+    /// （using WindowState = System.Windows.WindowState）与跨命名空间移动的类型
+    /// （WindowState/MarkupExtension）靠本表才能落在正确命名空间。</summary>
     public static readonly IReadOnlyDictionary<string, string> QualifiedTypeRenames = new Dictionary<string, string>
     {
         ["System.Windows.Point"] = "global::Avalonia.Point",
@@ -499,6 +609,17 @@ public static class KnownMaps
         ["System.Windows.Media.SolidColorBrush"] = "global::Avalonia.Media.SolidColorBrush",
         ["System.Windows.Threading.Dispatcher"] = "global::Avalonia.Threading.Dispatcher",
         ["System.Windows.Threading.DispatcherTimer"] = "global::Avalonia.Threading.DispatcherTimer",
+        // —— Window 枚举族（反射验证：Avalonia.Controls 命名空间，前缀替换会错位到 Avalonia.*）——
+        ["System.Windows.WindowState"] = "global::Avalonia.Controls.WindowState",
+        ["System.Windows.WindowStartupLocation"] = "global::Avalonia.Controls.WindowStartupLocation",
+        ["System.Windows.SizeToContent"] = "global::Avalonia.Controls.SizeToContent",
+        // —— 跨命名空间移动的基类/扩展点（前缀替换会得到不存在的类型）——
+        ["System.Windows.Markup.MarkupExtension"] = "global::Avalonia.Markup.Xaml.MarkupExtension",
+        ["System.Windows.Markup.IComponentConnector"] = "global::Avalonia.Markup.Xaml.IComponentConnector",
+        ["System.Windows.Media.Imaging.BitmapImage"] = "global::Avalonia.Media.Imaging.Bitmap",
+        ["System.Windows.Media.Imaging.BitmapSource"] = "global::Avalonia.Media.Imaging.Bitmap",
+        ["System.Windows.Controls.ContextMenuEventArgs"] = "global::Avalonia.Input.ContextRequestedEventArgs",
+        ["System.Windows.Media.ImageSource"] = "global::Avalonia.Media.IImage",
     };
 
     /// <summary>C# 事件成员重命名（+= / -= 右侧）。</summary>

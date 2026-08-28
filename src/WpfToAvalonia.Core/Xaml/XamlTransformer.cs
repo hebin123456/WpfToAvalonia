@@ -512,6 +512,25 @@ public sealed partial class XamlTransformer
                 continue;
             }
 
+            // ResizeMode → CanResize（值同步转换；WPF 枚举 → Avalonia bool）
+            //（反射验证 Avalonia 12 无 ResizeMode 枚举；ForkPlus 24 个 XAML 实测）
+            if (name == "ResizeMode")
+            {
+                var (val, lossy) = KnownMaps.ResizeModeToCanResize(value);
+                if (val != null)
+                {
+                    attr.Remove();
+                    if (el.Attribute("CanResize") == null)
+                        el.SetAttributeValue("CanResize", val);
+                    Note(el, lossy ? NoteSeverity.Warning : NoteSeverity.Info, "XAML-RESIZEMODE",
+                        $"ResizeMode=\"{value.Trim()}\" → CanResize=\"{val}\"" +
+                        (lossy
+                            ? "（语义有损：CanMinimize 的最小化保留靠系统菜单、CanResizeWithGrip 的 grip 无等价）。"
+                            : "（WPF ResizeMode 枚举 → Avalonia CanResize bool）。"));
+                }
+                continue;
+            }
+
             // 事件重命名（无命名空间属性不继承默认 ns）
             if (KnownMaps.XamlEventRenames.TryGetValue(name, out var ev))
             {
