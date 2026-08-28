@@ -1,0 +1,33 @@
+<Window x:Class="WpfShop.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:WpfShop.Controls"
+        Title="WPF 商店" Height="520" Width="780"
+        WindowStartupLocation="CenterScreen"
+        SnapsToDevicePixels="True">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Orientation="Horizontal" Margin="8">
+            <Label Content="商品列表" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox x:Name="SearchBox" Width="220"
+                     Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"/>
+            <Button Content="搜索" Style="{StaticResource PrimaryButton}" Margin="8,0,0,0" Click="OnSearch"/>
+            <Button Content="关闭" Margin="8,0,0,0" Click="CloseApp" ToolTipService.ToolTip="退出应用"/>
+            <Image Source="pack://application:,,,/WpfShop;component/Assets/logo.png"
+                   Width="24" Height="24" Margin="12,0,0,0" VerticalAlignment="Center"/>
+            <controls:Spinner Angle="90" Width="16" Height="16" Margin="8,0,0,0"/>
+        </StackPanel>
+
+        <DataGrid x:Name="ProductsGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True"
+                  SelectionChanged="OnSelectionChanged" MouseDown="OnGridMouseDown">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="名称" Binding="{Binding Name}"/>
+                <DataGridTextColumn Header="价格" Binding="{Binding Price, StringFormat='{}{0:C}', Mode=OneWay}"/>
+            </DataGrid.Columns>
+        </DataGrid>
+    </Grid>
+</Window>

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/WpfToAvalonia.Cli/WpfToAvalonia.Cli.csproj" />
+    <Project Path="src/WpfToAvalonia.Core/WpfToAvalonia.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/WpfToAvalonia.Tests/WpfToAvalonia.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,33 @@
+## 构建产物
+bin/
+obj/
+out/
+
+## IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+## 转换备份（工具生成的 WPF 原始工程备份）
+*.wpf-backup/
+
+## 测试与覆盖率
+TestResults/
+*.coverage
+coverage/
+
+## NuGet
+*.nupkg
+packages/
+
+## 系统文件
+.DS_Store
+Thumbs.db
+
+## 环境截图
+.screenshots/
+
+## 转换报告（运行产物）
+wpf2avalonia-report.md
