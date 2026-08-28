@@ -89,7 +89,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wpf2ava-${{ matrix.rid }}
-          path: wpf2ava-${{ matrix.rid }}-${VERSION}.${{ matrix.ext }}
+          path: wpf2ava-${{ matrix.rid }}-${{ env.VERSION }}.${{ matrix.ext }}
           if-no-files-found: error
 
   tool-package:
