@@ -625,6 +625,19 @@ public static class KnownMaps
         ["BindingListCollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable；分组/过滤在 ViewModel 层实现。",
     };
 
+    /// <summary>
+    /// 无等价、直接整条删除的 WPF 特性（注解级语义，删除即可编译）：
+    /// WpfOnlyTypes 中指引明确为"删除特性"的子集，由 VisitAttributeList 执行删除。
+    /// 键为特性名末段（"ValueConversion" 同时匹配 "ValueConversionAttribute"）。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> RemovedAttributes =
+        new Dictionary<string, string>
+        {
+            ["ValueConversion"] = "WPF 值转换器设计时元数据，Avalonia 无对应：直接实现 IValueConverter 即可（ForkPlus 8 处实测 CS0246）。",
+            ["ContentProperty"] = "类级内容属性注解：Avalonia 在属性上标 [Content]（Avalonia.Metadata）；Window 等基类 Content 属性已内建该标注（反射验证 12.1.1 无 ContentPropertyAttribute）。",
+            ["AssemblyAssociatedContentFile"] = "WPF 松散文件关联声明：Avalonia 资源体系（avares://）不需要（ForkPlus AssemblyInfo.cs 实测 CS0246）。",
+        };
+
     /// <summary>全限定类型映射（System.Windows.Point 等）。
     /// 精确全名匹配优先于 QualifiedPrefixes 前缀替换——using 别名
     /// （using WindowState = System.Windows.WindowState）与跨命名空间移动的类型

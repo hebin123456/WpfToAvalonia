@@ -827,6 +827,79 @@ public class CSharpTransformerTests
     }
 
     [Fact]
+    public void ValueConversionAttribute_IsRemoved()
+    {
+        // ForkPlus InverseBooleanConverter 等实测：CS0246（Avalonia 12 无此特性）
+        var r = Transform("""
+            using System;
+            using System.Globalization;
+            using System.Windows.Data;
+
+            namespace Demo
+            {
+                [ValueConversion(typeof(bool), typeof(bool))]
+                public class InverseBooleanConverter : IValueConverter
+                {
+                    public object Convert(object value, Type targetType, object parameter, CultureInfo culture) => !(bool)value;
+                }
+            }
+            """);
+
+        Assert.DoesNotContain("ValueConversion", r.Code);
+        Assert.Contains("IValueConverter", r.Code); // 类与实现保留
+        Assert.Contains(r.Notes, n => n.Rule == "CS-ATTRIBUTE-REMOVED");
+    }
+
+    [Fact]
+    public void ContentPropertyAttribute_IsRemoved_NonWpfSameName_Kept()
+    {
+        // 删除：类级 [ContentProperty("Content")]（ForkPlus CustomWindow.cs 实测 CS0246）
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                [ContentProperty("Content")]
+                public class CustomWindow : Window
+                {
+                    public object Content { get; set; }
+                }
+            }
+            """);
+
+        Assert.DoesNotContain("ContentProperty", r.Code);
+        Assert.Contains("class CustomWindow", r.Code); // 类型本体保留
+        Assert.Contains(r.Notes, n => n.Rule == "CS-ATTRIBUTE-REMOVED");
+
+        // 保留：非 WPF 前缀的限定同名特性（用户自有类型不受误删）
+        var r2 = Transform("""
+            namespace Demo
+            {
+                [MyLib.ContentProperty("X")]
+                public class C2 { }
+            }
+            """);
+
+        Assert.Contains("MyLib.ContentProperty", r2.Code);
+    }
+
+    [Fact]
+    public void AssemblyAssociatedContentFileAttribute_IsRemoved()
+    {
+        // ForkPlus AssemblyInfo.cs 实测 CS0246（WPF 松散文件关联）
+        var r = Transform("""
+            using System.Reflection;
+
+            [assembly: AssemblyAssociatedContentFile("webview2loader.dll")]
+
+            namespace Demo { }
+            """);
+
+        Assert.DoesNotContain("AssemblyAssociatedContentFile", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-ATTRIBUTE-REMOVED");
+    }
+
+    [Fact]
     public void WpfOnlyType_GetsManualNote_WithAlternative()
     {
         var r = Transform("""

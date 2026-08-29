@@ -827,6 +827,10 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     /// <summary>
     /// [assembly: ThemeInfo(...)] 特性整条删除：WPF 主题资源位置声明，Avalonia 无等价
     ///（主题经 App.Styles / ResourceInclude 引入；ForkPlus AssemblyInfo.cs 实测 CS0246）。
+    /// KnownMaps.RemovedAttributes（ValueConversion/ContentProperty/
+    /// AssemblyAssociatedContentFile）同样整条删除：注解级语义无运行时行为，
+    /// 删除即编译通过（ForkPlus 端到端 CS0246 实测；ContentProperty 的 Avalonia
+    /// 等价是属性级 [Content]，见特性删除提示）。
     /// AttributeList 作为 SyntaxList 成员，返回 null 由列表访问器剔除。
     /// </summary>
     public override SyntaxNode? VisitAttributeList(AttributeListSyntax node)
@@ -842,6 +846,29 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             Note(node, NoteSeverity.Info, "CS-THEMEINFO-REMOVED",
                 "ThemeInfo 特性已删除（WPF 主题资源位置声明，Avalonia 主题经 App.Styles 引入）。");
             return null;
+        }
+
+        // —— WPF 独有特性整条删除（KnownMaps.RemovedAttributes，末段名匹配）——
+        // [ValueConversion(typeof(bool), typeof(bool))] / [ContentProperty("Content")] /
+        // [assembly: AssemblyAssociatedContentFile("...")]：限定与否均按末段匹配，
+        // 限定形式仅 System.Windows.* 前缀命中（用户自有同名特性不受影响）。
+        foreach (var attr in node.Attributes)
+        {
+            var full = attr.Name.ToString();
+            var last = full.Contains('.')
+                ? full[(full.LastIndexOf('.') + 1)..]
+                : full;
+            var isWpfQualified = full.StartsWith("System.Windows", StringComparison.Ordinal);
+            if (KnownMaps.RemovedAttributes.TryGetValue(last.TrimEnd('A','t','t','r','i','b','u','t','e'), out var why) ||
+                KnownMaps.RemovedAttributes.TryGetValue(last, out why))
+            {
+                if (full.Contains('.') && !isWpfQualified) continue; // 限定名非 WPF 前缀：用户自有类型
+                WpfDetected = true;
+                if (last.EndsWith("Attribute", StringComparison.Ordinal)) last = last[..^9];
+                Note(node, NoteSeverity.Info, "CS-ATTRIBUTE-REMOVED",
+                    $"[{full}] 特性已删除：{why}");
+                return null;
+            }
         }
         return base.VisitAttributeList(node);
     }
