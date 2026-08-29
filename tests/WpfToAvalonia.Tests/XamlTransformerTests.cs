@@ -513,6 +513,54 @@ public class XamlTransformerTests
     }
 
     [Fact]
+    public void VsmPropertyElement_CommentedOut_WholeBlock()
+    {
+        // 反射探针17：Avalonia 12 无 VSM 类型。属性元素 <VisualStateManager.VisualStateGroups>
+        //（点在 LocalName 内）原样残留会报 AVLN2000 Unknown type（ForkPlus Calendar 实测）
+        var r = Transform("""
+            <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Grid>
+                    <VisualStateManager.VisualStateGroups>
+                        <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal" />
+                            <VisualState x:Name="Disabled">
+                                <Storyboard><DoubleAnimation To="0.5" /></Storyboard>
+                            </VisualState>
+                        </VisualStateGroup>
+                    </VisualStateManager.VisualStateGroups>
+                    <TextBlock Text="keep" />
+                </Grid>
+            </Window>
+            """);
+
+        // 存活树中无 VSM 族（注释里的原始片段不算）
+        var doc = System.Xml.Linq.XDocument.Parse(r.Xaml);
+        Assert.DoesNotContain(doc.Root!.Descendants(),
+            e => e.Name.LocalName.StartsWith("VisualState", StringComparison.Ordinal));
+        Assert.DoesNotContain(doc.Root!.Descendants(), e => e.Name.LocalName == "Storyboard");
+        Assert.Contains("keep", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-VSM-REMOVED");
+    }
+
+    [Fact]
+    public void BitmapImageResource_BecomesAvaloniaUriString()
+    {
+        // 反射探针17：Avalonia 12 Bitmap 无属性语法 ctor/UriSource——字典级图片唯一编译期合法
+        // 等价物是 x:String 存 avares URI（键不断链，引用处运行时解析）
+        var r = Transform("""
+            <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <BitmapImage x:Key="TagIcon" UriSource="/Assets/Tag.png" />
+            </ResourceDictionary>
+            """);
+
+        Assert.DoesNotContain("BitmapImage", r.Xaml);
+        Assert.Contains("""<x:String x:Key="TagIcon">avares://TestApp/Assets/Tag.png</x:String>""", r.Xaml);
+        Assert.Contains(r.Notes, n => n.Rule == "XAML-BITMAPIMAGE-STRING");
+    }
+
+    [Fact]
     public void OxyPlotNamespace_ElementsCommentedOut_RootDeclRemoved()
     {
         var r = Transform("""

@@ -172,6 +172,50 @@ public sealed partial class XamlTransformer
                 }
             }
 
+            // —— VisualStateManager 属性元素族：整块注释移除 ——
+            // 属性元素 <VisualStateManager.VisualStateGroups>（点在 LocalName 内，UnsupportedElements
+            // 匹配不到）原样残留 → AVLN2000 Unknown type VisualStateGroup + x:Name 属性错误
+            //（ForkPlus Calendar.axaml 实测；反射探针17：Avalonia 12 无 VSM 类型）。
+            // Avalonia 状态表达 = 伪类 + 样式动画，整块注释 + 人工指引。
+            if (el.Parent != null && local.StartsWith("VisualStateManager.", StringComparison.Ordinal))
+            {
+                var stateCount = el.Descendants().Count(d => d.Name.LocalName == "VisualState");
+                Note(el, NoteSeverity.Manual, "XAML-VSM-REMOVED",
+                    $"VisualStateManager 状态组（{stateCount} 个 VisualState + Storyboard 动画）已整块注释移除：" +
+                    "Avalonia 无 VSM（反射验证），状态视觉请改写为伪类嵌套样式 + Transitions/Animation（CSS 式关键帧，" +
+                    "如 Selector=\"^:selected\" + <Setter Property=\"Opacity\" …/>）。");
+                ReplaceWithComment(el, "XAML-VSM-REMOVED",
+                    "VisualStateManager.VisualStateGroups：Avalonia 无 VSM，改伪类样式 + Animation。");
+                return;
+            }
+
+            // —— BitmapImage 字典资源 → x:String（avares URI）——
+            // 反射探针17：Avalonia 12 Bitmap 无属性语法 ctor/UriSource/TypeConverter——
+            // 字典里无法用属性语法建图。等价方案：x:String 存 avares URI（编译期合法资源条目，
+            // 69 个图标键不断链）；引用处 Image.Source={DynamicResource} 编译期不做值类型检查
+            //（运行时需人工改直写 URI 或加字符串→IImage 转换，Manual 提示覆盖）。
+            if (el.Parent != null && local == "BitmapImage")
+            {
+                var keyAttr = el.Attribute(XNs + "Key");
+                var uriAttr = el.Attribute("UriSource");
+                if (keyAttr != null && uriAttr != null)
+                {
+                    // WPF "/Assets/X.png"（pack 前导斜杠） → "avares://<asm>/Assets/X.png"
+                    var rel = uriAttr.Value.TrimStart('/');
+                    var avares = rel.StartsWith("avares://", StringComparison.Ordinal) || rel.StartsWith("http", StringComparison.Ordinal)
+                        ? rel
+                        : $"avares://{_assemblyName}/{rel}";
+                    var str = new XElement(XNs + "String", avares);
+                    str.SetAttributeValue(XNs + "Key", keyAttr.Value);
+                    el.ReplaceWith(str);
+                    Note(el, NoteSeverity.Manual, "XAML-BITMAPIMAGE-STRING",
+                        $"BitmapImage 资源 {keyAttr.Value} → x:String \"{avares}\"（Avalonia Bitmap 无属性语法 ctor，" +
+                        "反射验证）：编译期合法；引用处 Image.Source={DynamicResource} 为运行时解析，" +
+                        "启动后需把 Source 直写 URI 字符串（XamlIl 编译期转换）或移除 DynamicResource 改 StaticResource 同样形态。");
+                    return;
+                }
+            }
+
             // —— 无等价物元素：保留 + 人工提示 ——
             if (KnownMaps.UnsupportedElements.Contains(local))
             {
