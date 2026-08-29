@@ -418,7 +418,7 @@ public class CSharpTransformerTests
     }
 
     [Fact]
-    public void ManualNoteOverride_WithoutAvaloniaVirtual_StaysUntouched()
+    public void ManualNoteOverride_DeOverridden_PlainMethod()
     {
         var r = Transform("""
             using System.Windows;
@@ -432,9 +432,64 @@ public class CSharpTransformerTests
             }
             """);
 
-        // Window 激活无虚方法：不改签名，仅人工提示
-        Assert.Contains("OnActivated(EventArgs e)", r.Code);
-        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL");
+        // Window 激活无虚方法：去 override 化（普通方法）+ 人工提示，方法体保留
+        Assert.Contains("protected void OnActivated(EventArgs e)", r.Code);
+        Assert.DoesNotContain("override", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-DEOVERRIDE");
+    }
+
+    [Fact]
+    public void DeOverride_BaseCallRemoved_WhenBaseIsAvaloniaControl()
+    {
+        // CustomWindow : Window 场景（ForkPlus 实测）：基类是 Avalonia 类型 →
+        // 方法体内 base.OnActivated(e) 语句删除（Avalonia Window 无此成员）
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class CustomWindow : Window
+                {
+                    protected override void OnActivated(EventArgs e)
+                    {
+                        base.OnActivated(e);
+                        DoSomething();
+                    }
+                    void DoSomething() { }
+                }
+            }
+            """);
+
+        Assert.Contains("protected void OnActivated(EventArgs e)", r.Code);
+        Assert.DoesNotContain("base.OnActivated", r.Code);
+        Assert.Contains("DoSomething", r.Code); // 其余方法体保留
+        Assert.Contains(r.Notes, n => n.Rule == "CS-BASE-REMOVED");
+    }
+
+    [Fact]
+    public void DeOverride_BaseCallKept_WhenBaseIsUserClass()
+    {
+        // DialogWindow : CustomWindow 场景：用户基类降级后自有该普通方法，
+        // base 调用保留（逻辑链不断：基类 OnActivated 体仍会执行）
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                class CustomWindow : Window
+                {
+                    protected override void OnActivated(EventArgs e) { base.OnActivated(e); }
+                }
+                class DialogWindow : CustomWindow
+                {
+                    protected override void OnActivated(EventArgs e) { base.OnActivated(e); }
+                }
+            }
+            """);
+
+        // CustomWindow（基类 Window）的 base 调用删除；DialogWindow（基类用户类）保留
+        var doc = r.Code;
+        Assert.Equal(1, doc.Split("base.OnActivated").Length - 1);
     }
 
     [Fact]
@@ -759,11 +814,12 @@ public class CSharpTransformerTests
             }
             """);
 
-        // ToggleButton 无 OnChecked/OnChecked 虚方法、ContentControl 无 OnContentChanged：保留签名 + 人工提示
-        Assert.Contains("OnChecked(RoutedEventArgs e)", r.Code);
-        Assert.Contains("OnContentChanged(object oldContent, object newContent)", r.Code);
-        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL" && n.Message.Contains("OnIsCheckedChanged"));
-        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-MANUAL" && n.Message.Contains("OnContentChanged"));
+        // ToggleButton 无 OnChecked 虚方法、ContentControl 无 OnContentChanged：
+        // 去 override 化（普通方法，签名保留）+ 人工提示
+        Assert.Contains("protected void OnChecked(RoutedEventArgs e)", r.Code);
+        Assert.Contains("protected void OnContentChanged(object oldContent, object newContent)", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-DEOVERRIDE" && n.Message.Contains("OnIsCheckedChanged"));
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-DEOVERRIDE" && n.Message.Contains("OnContentChanged"));
     }
 
     [Fact]
@@ -809,6 +865,62 @@ public class CSharpTransformerTests
         Assert.Contains("using AvaloniaEdit.Rendering", r.Code);
         Assert.Contains("AvaloniaEdit.Document.TextDocument", r.Code);
         Assert.DoesNotContain("ICSharpCode", r.Code);
+    }
+
+    [Fact]
+    public void ControlTemplateType_MapsToIControlTemplate()
+    {
+        // 反射验证（Avalonia 12 探针16）：无 ControlTemplate 类，XAML 的 <ControlTemplate>
+        // 由 XamlIl 编译器特殊处理；C# 侧声明用 IControlTemplate（ForkPlus ControlTemplateExtensions 实测）
+        var r = Transform("""
+            using System.Windows.Controls;
+
+            namespace Demo
+            {
+                public static class Ex
+                {
+                    public static bool TryFindName(this ControlTemplate source, string name)
+                        => false;
+                }
+            }
+            """);
+
+        Assert.Contains("global::Avalonia.Controls.Templates.IControlTemplate source", r.Code);
+        Assert.DoesNotContain("ControlTemplate source", r.Code.Replace("IControlTemplate source", ""));
+    }
+
+    [Fact]
+    public void AppLifecycle_OnStartup_DeOverridden_ParamToObject_BaseCallRemoved()
+    {
+        // 反射验证（Avalonia 12 探针16）：Application 无 OnStartup/OnExit 虚方法；
+        // StartupEventArgs→object（WPF 仅此语境出现）+ Application 入基类集合 → base 调用删除
+        var r = Transform("""
+            using System.Windows;
+
+            namespace Demo
+            {
+                public class App : Application
+                {
+                    protected override void OnStartup(StartupEventArgs e)
+                    {
+                        base.OnStartup(e);
+                        InitializeServices();
+                    }
+                    protected override void OnExit(ExitEventArgs e)
+                    {
+                        base.OnExit(e);
+                    }
+                    void InitializeServices() { }
+                }
+            }
+            """);
+
+        Assert.Contains("protected void OnStartup(global::System.Object e)", r.Code);
+        Assert.Contains("protected void OnExit(global::System.Object e)", r.Code);
+        Assert.DoesNotContain("base.OnStartup", r.Code);
+        Assert.DoesNotContain("base.OnExit", r.Code);
+        Assert.Contains("InitializeServices", r.Code);
+        Assert.Contains(r.Notes, n => n.Rule == "CS-OVERRIDE-DEOVERRIDE" && n.Message.Contains("OnFrameworkInitializationCompleted"));
     }
 
     [Fact]

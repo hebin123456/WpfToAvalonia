@@ -444,6 +444,17 @@ public static class KnownMaps
         //（DragEventArgs.DataTransfer / DragDrop.DoDragDropAsync 参数；DataObject 已过时）。
         // 方法体 SetData/GetData 成员差异由 CS-DRAGDROP 人工提示覆盖。
         ["IDataObject"] = "global::Avalonia.Input.IDataTransfer",
+        // —— 反射验证（Avalonia 12 探针16）——
+        // ControlTemplate：Avalonia 12 无此类（XAML 的 <ControlTemplate> 由 XamlIl 编译器
+        // 特殊处理成 FuncControlTemplate，C# 侧无类型可引用）→ 代码声明用 IControlTemplate；
+        // 成员差异（FindName 等）由 CS-WPFONLY-TYPE 人工提示覆盖（ControlTemplateExtensions 实测）。
+        ["ControlTemplate"] = "global::Avalonia.Controls.Templates.IControlTemplate",
+        // StartupEventArgs/ExitEventArgs：WPF 仅存在于 Application.OnStartup/OnExit 参数
+        //（反射验证 Avalonia.Application 无此二虚方法）；类型映射为 object 使去 override 化
+        // 后的方法可编译（方法体仅 base 转发不引用 e；e.Args 引用由映射警告提示改
+        // Environment.GetCommandLineArgs()）。
+        ["StartupEventArgs"] = "global::System.Object",
+        ["ExitEventArgs"] = "global::System.Object",
         // WPF ListView → Avalonia ListBox 体系
         ["ListViewItem"] = "global::Avalonia.Controls.ListBoxItem",
         // ListView 本体（代码侧 new ListView()/类型声明）
@@ -623,6 +634,32 @@ public static class KnownMaps
         ["CollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable；排序/过滤在 ViewModel 层实现。",
         ["ICollectionView"] = "WPF 集合视图接口无等价：Avalonia 直接绑定 IEnumerable；排序/过滤在 ViewModel 层实现。",
         ["BindingListCollectionView"] = "WPF 集合视图无等价：Avalonia 直接绑定 IEnumerable；分组/过滤在 ViewModel 层实现。",
+    };
+
+    /// <summary>
+    /// 常见 Avalonia 控件基类名（去 override 化的 base 调用有效性判定）：
+    /// 类的基类列表命中本集合 → 基类是 Avalonia 类型（无 ManualNotes 方法成员），
+    /// 方法体内 base.Xxx(...) 语句可安全删除；未命中（如 CustomWindow 等用户基类）
+    /// → base 调用指向用户类降级后的普通方法，保留。
+    /// 名称经 Avalonia 12 Controls 反射核对（转换后基类名与 WPF 同名）。
+    /// </summary>
+    public static readonly IReadOnlySet<string> AvaloniaControlBaseNames = new HashSet<string>
+    {
+        // 窗口/页面/用户控件 + 应用宿主（App : Application 的 base.OnStartup/OnExit 删除判定）
+        "Application", "Window", "UserControl", "ContentControl", "Control", "TemplatedControl",
+        "HeaderedContentControl", "HeaderedItemsControl",
+        // 项集合
+        "ItemsControl", "ListBox", "ListBoxItem", "TabControl", "TabItem",
+        "TreeView", "TreeViewItem", "ComboBox", "ComboBoxItem", "Menu", "MenuItem",
+        // 输入
+        "TextBox", "Button", "ToggleButton", "CheckBox", "RadioButton",
+        "AutoCompleteBox", "NumericUpDown", "SplitButton",
+        // 布局/呈现
+        "Panel", "StackPanel", "Grid", "Canvas", "DockPanel", "WrapPanel", "UniformGrid",
+        "Border", "ScrollViewer", "Separator", "TextBlock", "Image", "Expander",
+        "Slider", "ProgressBar", "ToolTip", "Popup", "Calendar", "DatePicker",
+        // 高级（包内）
+        "DataGrid", "AvaloniaEdit.TextEditor",
     };
 
     /// <summary>

@@ -23,6 +23,8 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
     private readonly Stack<int> _methodParamCounts = new();
     /// <summary>类级撞名原方法名栈（VisitClassDeclaration 预扫描，见 CS-OVERRIDE-CLASH）。</summary>
     private readonly Stack<HashSet<string>> _clashOriginals = new();
+    /// <summary>当前遍历类的基类名集合栈（去 override 化 base 调用有效性判定）。</summary>
+    private readonly Stack<HashSet<string>> _classBaseNames = new();
     private static readonly HashSet<string> NoClashes = new();
     private int _resourceVarCounter;
 
@@ -410,8 +412,33 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 return null;
             return SyntaxFactory.Block().WithTriviaFrom(node);
         }
+
+        // —— 去 override 化方法的 base.Xxx(...) 语句删除（基类是 Avalonia 类型时）——
+        // 虚方法降级后 base 调用指向不存在的基类成员（CS1061）；ForkPlus 实测全部 void 语句
+        // 形态可安全删除。判据：当前类的基类命中 KnownMaps.AvaloniaControlBaseNames ——
+        // 如 CustomWindow : Window（删除）；DialogWindow : CustomWindow（用户基类降级后
+        // 自有该普通方法，保留调用，逻辑链不断）。表达式语境（return base.Xxx）不在此列，
+        // 留作人工（CS1061 可见）。
+        if (node.Expression is InvocationExpressionSyntax dinv &&
+            dinv.Expression is MemberAccessExpressionSyntax dma &&
+            dma.Expression is BaseExpressionSyntax &&
+            KnownMaps.OverrideMethodManualNotes.ContainsKey(dma.Name.Identifier.ValueText) &&
+            ClassBaseIsAvaloniaControl())
+        {
+            WpfDetected = true;
+            Note(node, NoteSeverity.Info, "CS-BASE-REMOVED",
+                $"base.{dma.Name.Identifier.ValueText}(...) 语句已删除（虚方法已降级，Avalonia 基类无此成员）。");
+            if (node.Parent is BlockSyntax or SwitchSectionSyntax or GlobalStatementSyntax)
+                return null;
+            return SyntaxFactory.Block().WithTriviaFrom(node);
+        }
         return base.VisitExpressionStatement(node);
     }
+
+    /// <summary>当前类的基类是否为已知 Avalonia 控件（非用户中间类）。</summary>
+    private bool ClassBaseIsAvaloniaControl() =>
+        _classBaseNames.Count > 0 &&
+        _classBaseNames.Peek().Any(b => KnownMaps.AvaloniaControlBaseNames.Contains(b));
 
     // ------------------------------------------------------------------ 调用点
 
@@ -983,11 +1010,17 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
                 _methodParamCounts.Pop();
                 _methodParamCounts.Push(renamed.ParameterList.Parameters.Count);
             }
-            // —— 无覆盖点/已 sealed 的虚方法：保留签名 + 人工提示 ——
+            // —— 无覆盖点/已 sealed 的虚方法：去 override 化 + 人工提示 ——
+            // 方法降级为普通方法（Avalonia 继承链无此虚方法，override 保留必报 CS0115；
+            // 方法体逻辑原样保留待人工接线）。ForkPlus 端到端实测：94 处 CS0115。
             else if (isOverride && KnownMaps.OverrideMethodManualNotes.TryGetValue(name, out var manualNote))
             {
                 WpfDetected = true;
-                Note(node, NoteSeverity.Manual, "CS-OVERRIDE-MANUAL", $"override {name}：{manualNote}");
+                // 提示须在原 node 上记录（重赋值后的新节点位置丢失，去重键会撞同行）
+                Note(node, NoteSeverity.Manual, "CS-OVERRIDE-DEOVERRIDE",
+                    $"override {name} 已降级为普通方法（Avalonia 12 无此虚方法，CS0115 驱动；"
+                    + $"方法体逻辑保留，框架不再自动调用，需人工接线到等价事件/生命周期）：{manualNote}");
+                node = WithoutOverride(node);
             }
 
             if (node.Identifier.ValueText == "OnPropertyChanged" && node.Modifiers.Any(SyntaxKind.OverrideKeyword))
@@ -1079,8 +1112,15 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
         }
 
         _clashOriginals.Push(clash);
+        // —— 基类名栈：去 override 化的 base 调用有效性判定（见 VisitExpressionStatement）——
+        var baseNames = node.BaseList?.Types.Select(t =>
+        {
+            var n = t.Type.ToString();
+            return n.Contains('.') ? n[(n.LastIndexOf('.') + 1)..] : n; // 取末段
+        }).ToHashSet(StringComparer.Ordinal) ?? new HashSet<string>();
+        _classBaseNames.Push(baseNames);
         try { return base.VisitClassDeclaration(node); }
-        finally { _clashOriginals.Pop(); }
+        finally { _classBaseNames.Pop(); _clashOriginals.Pop(); }
     }
 
     // ------------------------------------------------------------------ 辅助
@@ -1138,6 +1178,34 @@ internal sealed class WpfCSharpRewriter : CSharpSyntaxRewriter
             access = access.WithTriviaFrom(m.Modifiers[0]);
         var tokens = new List<SyntaxToken> { access };
         tokens.AddRange(kept);
+        return m.WithModifiers(SyntaxFactory.TokenList(tokens));
+    }
+
+    /// <summary>
+    /// 去 override 化：移除 override 修饰符（方法降级为普通方法）。
+    /// override 位于首位时其 leading trivia（缩进/换行）转移给下一修饰符或返回类型，
+    /// 避免行首缩进丢失。
+    /// </summary>
+    private static MethodDeclarationSyntax WithoutOverride(MethodDeclarationSyntax m)
+    {
+        var idx = m.Modifiers.IndexOf(SyntaxKind.OverrideKeyword);
+        if (idx < 0) return m;
+        var tokens = m.Modifiers.ToList();
+        var overrideToken = tokens[idx];
+        tokens.RemoveAt(idx);
+        if (idx == 0)
+        {
+            if (tokens.Count > 0)
+            {
+                tokens[0] = tokens[0].WithLeadingTrivia(
+                    overrideToken.LeadingTrivia.Concat(tokens[0].LeadingTrivia));
+            }
+            else
+            {
+                return m.WithModifiers(SyntaxFactory.TokenList())
+                    .WithReturnType(m.ReturnType.WithLeadingTrivia(overrideToken.LeadingTrivia));
+            }
+        }
         return m.WithModifiers(SyntaxFactory.TokenList(tokens));
     }
 
