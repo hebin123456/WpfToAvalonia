@@ -151,6 +151,27 @@ public sealed partial class XamlTransformer
                 return;
             }
 
+            // —— 裸 ControlTemplate 资源（非 Setter.Value 内，如 x:Key 模板资源）——
+            // ControlTheme 管线（ConvertTemplateTriggers）只覆盖 Style/Setter.Value 链；
+            // 字典级裸模板的 .Triggers 无人处理会原样残留（AVLN2000 Trigger 无法解析，
+            // ForkPlus Slider.axaml 544 处实测）。Avalonia 伪类样式只能挂 ControlTheme →
+            // 整体注释移除 + 人工指引（把条件样式移到使用此模板的 ControlTheme 嵌套样式）。
+            if (local == "ControlTemplate" && el.Parent != null &&
+                el.Parent.Name.LocalName != "Setter.Value")
+            {
+                var orphanTriggers = el.Element(XName.Get("ControlTemplate.Triggers", ns));
+                if (orphanTriggers != null && orphanTriggers.Elements().Any())
+                {
+                    var count = orphanTriggers.Elements().Count();
+                    Note(orphanTriggers, NoteSeverity.Manual, "XAML-TEMPLATE-TRIGGER-ORPHAN",
+                        $"裸 ControlTemplate 资源的 .Triggers（{count} 个触发器）已注释移除：Avalonia 模板级触发器" +
+                        "无等价物（伪类样式只能挂在 ControlTheme 上），请把条件样式移到使用此模板的 ControlTheme " +
+                        "嵌套 Style（Selector=\"^:pseudo /template/ Part#Name\"）。");
+                    ReplaceWithComment(orphanTriggers, "XAML-TEMPLATE-TRIGGER-ORPHAN",
+                        "ControlTemplate.Triggers（裸模板资源）：Avalonia 无等价，条件样式须移至 ControlTheme 嵌套样式。");
+                }
+            }
+
             // —— 无等价物元素：保留 + 人工提示 ——
             if (KnownMaps.UnsupportedElements.Contains(local))
             {

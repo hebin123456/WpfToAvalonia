@@ -265,6 +265,11 @@ public static class KnownMaps
 
         // 属性名带命名空间前缀（附加属性/自定义控件属性）：匹配器语法不支持 → 人工
         if (prop.Contains(':') || prop.Contains('(')) return false;
+        // 类型前缀属性（CalendarButton.IsInactive / UIElement.IsMouseOver）：WPF 语义为
+        // "定义类上的属性"，WPF 已校验其存在于触发器目标类型继承链上 → 取末段。
+        // 带点属性名在 Avalonia 匹配器语法非法（AVLN2201 Expected '='，ForkPlus Calendar 实测）。
+        if (prop.Contains('.'))
+            prop = prop[(prop.LastIndexOf('.') + 1)..];
         // 空值/标记扩展/绑定值：无法字面解析（"" 对 Boolean 报 AVLN1000）→ 伪类或人工
         if (val.Length == 0 || val.StartsWith('{') || val.Contains(' ') || val.Contains(',')) return false;
         // 布尔属性以外的枚举/字符串值仅限安全字符（避免解析歧义）
